@@ -33,6 +33,45 @@ pub use self::error::Error;
 mod map;
 pub use self::map::{Input, Output, PsbtSighashType};
 
+/// Future version of PSBT this library can't parse
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct FutureVersionError(u32);
+
+impl fmt::Display for FutureVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PSBT version {} is not supported", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl ::std::error::Error for FutureVersionError {}
+
+/// Partially signed transaction version as defined in BIP-174 and BIP-370.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+#[non_exhaustive]
+pub enum Version {
+    /// PSBT version 0, defined in BIP-174
+    PsbtV0 = 0,
+    /// PSBT version 2, defined in BIP-370
+    PsbtV2 = 2,
+}
+
+impl Version {
+    fn to_raw(self) -> u32 {
+        self as u32
+    }
+
+    fn from_raw(version: u32) -> Result<Version, FutureVersionError> {
+        match version {
+            v if v == Version::PsbtV0 as u32 => Ok(Version::PsbtV0),
+            v if v == Version::PsbtV2 as u32 => Ok(Version::PsbtV2),
+            future => Err(FutureVersionError(future)),
+        }
+    }
+}
+
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -40,8 +79,8 @@ pub use self::map::{Input, Output, PsbtSighashType};
 pub struct Psbt {
     /// The unsigned transaction, scriptSigs and witnesses for each input must be empty.
     pub unsigned_tx: Transaction,
-    /// The version number of this PSBT. If omitted, the version number is 0.
-    pub version: u32,
+    /// The version number of this PSBT. If missing when serialized, the version number is 0.
+    pub version: Version,
     /// A global map from extended public keys to the used key fingerprint and
     /// derivation path as defined by BIP 32.
     pub xpub: BTreeMap<ExtendedPubKey, KeySource>,
@@ -112,7 +151,7 @@ impl Psbt {
 
             unsigned_tx: tx,
             xpub: Default::default(),
-            version: 0,
+            version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
         };
@@ -591,8 +630,9 @@ impl fmt::Display for GetKeyError {
 
         match *self {
             Bip32(ref e) => write_err!(f, "a bip23 error"; e),
-            NotSupported =>
-                f.write_str("the GetKey operation is not supported for this key request"),
+            NotSupported => {
+                f.write_str("the GetKey operation is not supported for this key request")
+            }
         }
     }
 }
@@ -610,7 +650,9 @@ impl std::error::Error for GetKeyError {
 }
 
 impl From<bip32::Error> for GetKeyError {
-    fn from(e: bip32::Error) -> Self { GetKeyError::Bip32(e) }
+    fn from(e: bip32::Error) -> Self {
+        GetKeyError::Bip32(e)
+    }
 }
 
 /// The various output types supported by the Bitcoin network.
@@ -711,8 +753,9 @@ impl fmt::Display for SignError {
             SighashComputation(ref e) => write!(f, "sighash: {}", e),
             UnknownOutputType => write!(f, "unable to determine the output type"),
             KeyNotFound => write!(f, "unable to find key"),
-            WrongSigningAlgorithm =>
-                write!(f, "attempt to sign an input with the wrong signing algorithm"),
+            WrongSigningAlgorithm => {
+                write!(f, "attempt to sign an input with the wrong signing algorithm")
+            }
             Unsupported => write!(f, "signing request currently unsupported"),
         }
     }
@@ -743,7 +786,9 @@ impl std::error::Error for SignError {
 }
 
 impl From<sighash::Error> for SignError {
-    fn from(e: sighash::Error) -> Self { SignError::SighashComputation(e) }
+    fn from(e: sighash::Error) -> Self {
+        SignError::SighashComputation(e)
+    }
 }
 
 #[cfg(feature = "base64")]
@@ -755,6 +800,7 @@ mod display_from_str {
     use internals::write_err;
 
     use super::{Error, Psbt};
+    use crate::psbt::FutureVersionError;
 
     /// Error encountered during PSBT decoding from Base64 string.
     #[derive(Debug)]
@@ -762,6 +808,8 @@ mod display_from_str {
     pub enum PsbtParseError {
         /// Error in internal PSBT data structure.
         PsbtEncoding(Error),
+        /// Future PSBT version, which is not yet supported by this library
+        Version(FutureVersionError),
         /// Error in PSBT Base64 encoding.
         Base64Encoding(::base64::DecodeError),
     }
@@ -772,6 +820,7 @@ mod display_from_str {
 
             match *self {
                 PsbtEncoding(ref e) => write_err!(f, "error in internal PSBT data structure"; e),
+                Version(ref e) => write_err!(f, "unrecognized PSBT version"; e),
                 Base64Encoding(ref e) => write_err!(f, "error in PSBT base64 encoding"; e),
             }
         }
@@ -784,6 +833,7 @@ mod display_from_str {
 
             match self {
                 PsbtEncoding(e) => Some(e),
+                Version(e) => Some(e),
                 Base64Encoding(e) => Some(e),
             }
         }
@@ -838,7 +888,7 @@ mod tests {
                 output: vec![],
             },
             xpub: Default::default(),
-            version: 0,
+            version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
             unknown: BTreeMap::new(),
 
@@ -936,7 +986,7 @@ mod tests {
                 ],
             },
             xpub: Default::default(),
-            version: 0,
+            version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
             inputs: vec![Input::default()],
@@ -1024,7 +1074,7 @@ mod tests {
         .collect();
 
         let psbt = Psbt {
-            version: 0,
+            version: Version::PsbtV0,
             xpub: {
                 let xpub: ExtendedPubKey =
                     "xpub661MyMwAqRbcGoRVtwfvzZsq2VBJR1LAHfQstHUoxqDorV89vRoMxUZ27kLrraAj6MPi\
@@ -1089,6 +1139,7 @@ mod tests {
         use crate::blockdata::script::ScriptBuf;
         use crate::blockdata::transaction::{OutPoint, Sequence, Transaction, TxIn, TxOut};
         use crate::blockdata::witness::Witness;
+        use crate::blockdata::witness::Witness;
         use crate::psbt::map::{Input, Map, Output};
         use crate::psbt::{raw, Error, Psbt};
         use crate::sighash::EcdsaSighashType;
@@ -1124,6 +1175,7 @@ mod tests {
                 // This weird thing is necessary since rustc 0.29 prints out I/O error in a different format than later versions
                 .map_err(|err| match err {
                     PsbtParseError::PsbtEncoding(err) => err,
+                    PsbtParseError::Version(_) => panic!("invalid version"),
                     PsbtParseError::Base64Encoding(_) => panic!("PSBT Base64 decoding failed")
                 })
                 .map_err(Error::from)
@@ -1198,7 +1250,7 @@ mod tests {
                     ],
                 },
                 xpub: Default::default(),
-                version: 0,
+                version: Version::PsbtV0,
                 proprietary: BTreeMap::new(),
                 unknown: BTreeMap::new(),
 
@@ -1529,7 +1581,7 @@ mod tests {
                     },
                 ],
             },
-            version: 0,
+            version: Version::PsbtV0,
             xpub: Default::default(),
             proprietary: Default::default(),
             unknown: BTreeMap::new(),
@@ -1698,7 +1750,7 @@ mod tests {
                 ],
             },
             xpub: Default::default(),
-            version: 0,
+            version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
             unknown: BTreeMap::new(),
 
