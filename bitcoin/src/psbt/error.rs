@@ -44,7 +44,7 @@ pub enum Error {
     UnsignedTxHasScriptSigs,
     /// The scriptWitnesses for the unsigned transaction must be empty.
     UnsignedTxHasScriptWitnesses,
-    /// A PSBT must have an unsigned transaction.
+    /// A PSBTV0 must have an unsigned transaction.
     MustHaveUnsignedTx,
     /// Signals that there are no more key-value pairs in a key-value map.
     NoMorePairs,
@@ -104,6 +104,22 @@ pub enum Error {
     PartialDataConsumption,
     /// I/O error.
     Io(io::Error),
+
+    // PsbtV0 field Errors
+    /// Unsigned Transaction not present in PsbtV0
+    MissingUnsignedTx,
+    /// Transaction Version is not allowed in PsbtV0
+    TxVersionPresent,
+    /// Fallback Locktime is not allowed in PsbtV0
+    FallbackLocktimePresent,
+    /// Transaction Modifiable flags are not allowed in PsbtV0
+    TxModifiablePresent,
+
+    // PsbtV2 field Errors
+    /// Transaction Version not present in PsbtV2
+    MissingTxVersion,
+    /// Unsigned Transaction is not allowed in PsbtV2
+    UnsignedTxPresent,
 }
 
 impl fmt::Display for Error {
@@ -161,6 +177,12 @@ impl fmt::Display for Error {
             Error::PartialDataConsumption =>
                 f.write_str("data not consumed entirely when explicitly deserializing"),
             Error::Io(ref e) => write_err!(f, "I/O error"; e),
+            Error::MissingUnsignedTx => f.write_str("unsigned transaction is required in PsbtV0"),
+            Error::TxVersionPresent => f.write_str("transaction version not allowed in PsbtV0"),
+            Error::FallbackLocktimePresent => f.write_str("fallback locktime not allowed in PsbtV0"),
+            Error::TxModifiablePresent => f.write_str("TxModifiable not allowed in PsbtV0"),
+            Error::MissingTxVersion => f.write_str("transaction version is required in PsbtV2"),
+            Error::UnsignedTxPresent => f.write_str("unsigned transaction not allowed in PsbtV2"),
         }
     }
 }
@@ -203,7 +225,13 @@ impl std::error::Error for Error {
             | TapTree(_)
             | XPubKey(_)
             | Version(_)
-            | PartialDataConsumption => None,
+            | PartialDataConsumption
+            | MissingUnsignedTx
+            | TxVersionPresent
+            | FallbackLocktimePresent
+            | TxModifiablePresent
+            | MissingTxVersion
+            | UnsignedTxPresent => None,
         }
     }
 }

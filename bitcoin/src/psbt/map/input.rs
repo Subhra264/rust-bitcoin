@@ -6,6 +6,8 @@ use core::str::FromStr;
 
 use hashes::{self, hash160, ripemd160, sha256, sha256d};
 use secp256k1::XOnlyPublicKey;
+use crate::hash_types::Txid;
+use crate::blockdata::transaction::Sequence;
 
 use crate::bip32::KeySource;
 use crate::blockdata::script::ScriptBuf;
@@ -132,6 +134,24 @@ pub struct Input {
     /// Unknown key-value pairs for this input.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq_byte_values"))]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
+
+    // Psbtv2 fields
+    /// Represents the transaction Id of the previous transaction whose UTXO is being spent.
+    /// Required in PSBTv2 and must be excluded in PSBTv0.
+    pub previous_tx_id: Option<Txid>,
+    /// Little endian key type that stores the index of the unspent output of the corresponding
+    /// `previous_tx_id`. Required in PSBTv2 and must be excluded in PSBTv0.
+    pub output_index: Option<u32>,
+    /// Represents the sequence number of this input. Must be excluded in PSBTv0 and optional
+    /// in PSBTv2. If not specified in PSBTv2, the default sequence number `0xFFFFFFFF` is assumed.
+    /// Optional in PSBTv2, but not allowed in PSBTv0.
+    pub sequence: Option<Sequence>,
+    /// Represents the minimum UNIX timestamp to set as the lock time for this transaction.
+    /// Optional in PSBTv2, not allowed in PSBTv0.
+    pub required_time_locktime: Option<u32>,
+    /// Represents the minimum block height required to be set as the transaction’s lock time.
+    /// Optional in PSBTv2, not allowed in PSBTv0.
+    pub required_height_locktime: Option<u32>,
 }
 
 /// A Signature hash type for the corresponding input. As of taproot upgrade, the signature hash

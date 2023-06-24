@@ -72,14 +72,24 @@ impl Version {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+pub struct TxModifiable {
+    pub input_modifiable: bool,
+    pub output_modifiable: bool,
+    pub has_sighash_single: bool,
+    // More flags
+}
+
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
-pub struct Psbt {
+pub struct PsbtInner {
     /// The unsigned transaction, scriptSigs and witnesses for each input must be empty.
-    pub unsigned_tx: Transaction,
-    /// The version number of this PSBT. If missing when serialized, the version number is 0.
+    pub unsigned_tx: Option<Transaction>,
+    /// The version number of this PSBT. If omitted, the version number is PsbtV0.
     pub version: Version,
     /// A global map from extended public keys to the used key fingerprint and
     /// derivation path as defined by BIP 32.
@@ -95,9 +105,89 @@ pub struct Psbt {
     pub inputs: Vec<Input>,
     /// The corresponding key-value map for each output in the unsigned transaction.
     pub outputs: Vec<Output>,
+
+    // PsbtV2 fields
+    /// 32-bit little endian signed integer representing the
+    /// version number of the transaction being created
+    pub tx_version: Option<i32>,
+    /// 32-bit little endian unsigned integer representing the transaction locktime
+    /// to use if no inputs specify a required locktime.
+    pub fallback_locktime: Option<u32>,
+    /// PSBTv2 field for various transaction modification flags
+    pub tx_modifiable: Option<TxModifiable>,
+}
+
+impl PsbtInner {
+    /// Validates the given `PsbtInner` according to its version
+    pub fn validate_inner(&self) -> Result<(), Error> {
+        match self.version {
+            Version::PsbtV0 => {
+                // Validate the inner as PsbtV0
+                // unsigned_tx --> required
+                if self.unsigned_tx == None {
+                    return Err(Error::MissingUnsignedTx);
+                }
+
+                // tx_version --> None
+                if let Some(_) = self.tx_version {
+                    return Err(Error::TxVersionPresent);
+                }
+
+                // fallback_locktime: None
+                if let Some(_) = self.fallback_locktime {
+                    return Err(Error::FallbackLocktimePresent);
+                }
+
+                // tx_modifiable --> None
+                if let Some(_) = self.tx_modifiable {
+                    return Err(Error::TxModifiablePresent);
+                }
+            }
+            Version::PsbtV2 => {
+                // Validate the inner as PsbtV2
+                // unsigned_tx --> None
+                if let Some(_) = self.unsigned_tx {
+                    return Err(Error::UnsignedTxPresent);
+                }
+
+                // tx_version: --> required
+                if self.tx_version == None {
+                    return Err(Error::MissingTxVersion);
+                }
+
+                // fallback_locktime --> Not required but can be present
+                // tx_modifiable --> Not requried but can be present
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Partially signed transaction, commonly referred to as a PSBT.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+pub struct Psbt {
+    inner: PsbtInner,
 }
 
 impl Psbt {
+    /// Builds a validated `Psbt` from the given `PsbtInner`
+    pub fn from_inner(psbt: PsbtInner) -> Result<Psbt, Error> {
+        match psbt.validate_inner() {
+            Ok(()) => Ok(Psbt { inner: psbt }),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Returns the underlying [PsbtInner]
+    ///
+    /// Since the ownership is lost, another [Psbt] needs to be created using `Psbt::from_inner`.
+    pub fn to_inner(self) -> PsbtInner {
+        self.inner
+    }
+
     /// Returns an iterator for the funding UTXOs of the psbt
     ///
     /// For each PSBT input that contains UTXO information `Ok` is returned containing that information.
@@ -139,21 +229,25 @@ impl Psbt {
         Ok(())
     }
 
-    /// Creates a PSBT from an unsigned transaction.
+    /// Creates a PSBTV0 from an unsigned transaction.
     ///
     /// # Errors
     ///
     /// If transactions is not unsigned.
     pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, Error> {
-        let psbt = Psbt {
+        let psbt = PsbtInner {
             inputs: vec![Default::default(); tx.input.len()],
             outputs: vec![Default::default(); tx.output.len()],
 
-            unsigned_tx: tx,
+            unsigned_tx: Some(tx),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
+
+            tx_version: None,
+            fallback_locktime: None,
+            tx_modifiable: None,
         };
         psbt.unsigned_tx_checks()?;
         Ok(psbt)
@@ -880,13 +974,13 @@ mod tests {
 
     #[test]
     fn trivial_psbt() {
-        let psbt = Psbt {
-            unsigned_tx: Transaction {
+        let psbt = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::ZERO,
                 input: vec![],
                 output: vec![],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
@@ -894,6 +988,10 @@ mod tests {
 
             inputs: vec![],
             outputs: vec![],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         assert_eq!(psbt.serialize_hex(), "70736274ff01000a0200000000000000000000");
     }
@@ -953,8 +1051,8 @@ mod tests {
 
     #[test]
     fn serialize_then_deserialize_global() {
-        let expected = Psbt {
-            unsigned_tx: Transaction {
+        let expected = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![TxIn {
@@ -984,13 +1082,17 @@ mod tests {
                         .unwrap(),
                     },
                 ],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
             inputs: vec![Input::default()],
             outputs: vec![Output::default(), Output::default()],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
 
         let actual: Psbt = Psbt::deserialize(&expected.serialize()).unwrap();
@@ -1073,7 +1175,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let psbt = Psbt {
+        let psbt = PsbtInner {
             version: Version::PsbtV0,
             xpub: {
                 let xpub: ExtendedPubKey =
@@ -1081,12 +1183,12 @@ mod tests {
                     QfrDb27gigC1VS1dBXi5jGpxmMeBXEkKkcXUTg4".parse().unwrap();
                 vec![(xpub, key_source)].into_iter().collect()
             },
-            unsigned_tx: {
+            unsigned_tx: Some({
                 let mut unsigned = tx.clone();
                 unsigned.input[0].script_sig = ScriptBuf::new();
                 unsigned.input[0].witness = Witness::default();
                 unsigned
-            },
+            }),
             proprietary: proprietary.clone(),
             unknown: unknown.clone(),
 
@@ -1123,6 +1225,10 @@ mod tests {
                     ..Default::default()
                 }
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         let encoded = serde_json::to_string(&psbt).unwrap();
         let decoded: Psbt = serde_json::from_str(&encoded).unwrap();
@@ -1223,8 +1329,8 @@ mod tests {
 
         #[test]
         fn valid_vector_1() {
-            let unserialized = Psbt {
-                unsigned_tx: Transaction {
+            let unserialized = PsbtInner {
+                unsigned_tx: Some(Transaction {
                     version: 2,
                     lock_time: absolute::LockTime::from_consensus(1257139),
                     input: vec![
@@ -1248,7 +1354,7 @@ mod tests {
                             script_pubkey: ScriptBuf::from_hex("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787").unwrap(),
                         },
                     ],
-                },
+                }),
                 xpub: Default::default(),
                 version: Version::PsbtV0,
                 proprietary: BTreeMap::new(),
@@ -1307,6 +1413,10 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+
+                tx_modifiable: None,
+                tx_version: None,
+                fallback_locktime: None,
             };
 
             let base16str = "70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab300000000000000";
@@ -1555,8 +1665,8 @@ mod tests {
         hash160_preimages.insert(hash160::Hash::hash(&[1u8]), vec![1u8]);
 
         // same vector as valid_vector_1 from BIPs with added
-        let mut unserialized = Psbt {
-            unsigned_tx: Transaction {
+        let mut unserialized = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![
@@ -1580,7 +1690,7 @@ mod tests {
                         script_pubkey: ScriptBuf::from_hex("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787").unwrap(),
                     },
                 ],
-            },
+            }),
             version: Version::PsbtV0,
             xpub: Default::default(),
             proprietary: Default::default(),
@@ -1639,6 +1749,10 @@ mod tests {
                     ..Default::default()
                 },
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         unserialized.inputs[0].hash160_preimages = hash160_preimages;
         unserialized.inputs[0].sha256_preimages = sha256_preimages;
@@ -1724,8 +1838,8 @@ mod tests {
         let output_1_val = Amount::from_sat(100_000_000);
         let prev_output_val = Amount::from_sat(200_000_000);
 
-        let mut t = Psbt {
-            unsigned_tx: Transaction {
+        let mut t = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![
@@ -1748,7 +1862,7 @@ mod tests {
                         script_pubkey:  ScriptBuf::new()
                     },
                 ],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
@@ -1799,6 +1913,10 @@ mod tests {
                     ..Default::default()
                 },
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         assert_eq!(
             t.fee().expect("fee calculation"),
@@ -1840,7 +1958,7 @@ mod tests {
             input: vec![TxIn::default(), TxIn::default()],
             output: vec![TxOut::NULL],
         };
-        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        let mut psbt = PsbtInner::from_unsigned_tx(unsigned_tx).unwrap();
 
         let (priv_key, pk, secp) = gen_keys();
 
