@@ -5,6 +5,7 @@ use core::convert::TryFrom;
 use secp256k1::XOnlyPublicKey;
 use {core, secp256k1};
 
+use crate::Amount;
 use crate::bip32::KeySource;
 use crate::blockdata::script::ScriptBuf;
 use crate::prelude::*;
@@ -54,6 +55,11 @@ pub struct Output {
     /// Unknown key-value pairs for this output.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq_byte_values"))]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
+
+    // Psbtv2 fields
+    pub amount: Option<Amount>,
+    // use crate::blockdata::script::ScriptBuf;
+    pub script: Option<ScriptBuf>,
 }
 
 impl Output {

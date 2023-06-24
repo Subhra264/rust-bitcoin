@@ -6,6 +6,8 @@ use core::str::FromStr;
 
 use hashes::{self, hash160, ripemd160, sha256, sha256d};
 use secp256k1::XOnlyPublicKey;
+use crate::hash_types::Txid;
+use crate::blockdata::transaction::Sequence;
 
 use crate::bip32::KeySource;
 use crate::blockdata::script::ScriptBuf;
@@ -131,6 +133,13 @@ pub struct Input {
     /// Unknown key-value pairs for this input.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq_byte_values"))]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
+
+    // Psbtv2 fields
+    pub previous_tx_id: Option<Txid>, // Required in PsbtV2.
+    pub output_index: Option<u32>, // Required in PsbtV2
+    pub sequence: Option<Sequence>, // Optional in PsbtV2, but not allowed in PsbtV0
+    pub required_time_locktime: Option<u32>, // Optional in PsbtV2, not allowed in PsbtV0
+    pub required_height_locktime: Option<u32>, // Optional in PsbtV2, not allowed in PsbtV0
 }
 
 /// A Signature hash type for the corresponding input. As of taproot upgrade, the signature hash

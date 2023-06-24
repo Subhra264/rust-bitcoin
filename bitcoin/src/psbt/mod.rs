@@ -34,9 +34,6 @@ pub use self::error::Error;
 mod map;
 pub use self::map::{Input, Output, PsbtSighashType};
 
-/// Partially signed transaction, commonly referred to as a PSBT.
-pub type Psbt = PartiallySignedTransaction;
-
 /// Future version of PSBT this library can't parse
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct FutureVersionError(u32);
@@ -80,10 +77,10 @@ impl Version {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
-pub struct PartiallySignedTransaction {
+pub struct PsbtInner {
     /// The unsigned transaction, scriptSigs and witnesses for each input must be empty.
-    pub unsigned_tx: Transaction,
-    /// The version number of this PSBT. If missing when serialized, the version number is 0.
+    pub unsigned_tx: Option<Transaction>,
+    /// The version number of this PSBT. If omitted, the version number is PsbtV0.
     pub version: Version,
     /// A global map from extended public keys to the used key fingerprint and
     /// derivation path as defined by BIP 32.
@@ -99,9 +96,19 @@ pub struct PartiallySignedTransaction {
     pub inputs: Vec<Input>,
     /// The corresponding key-value map for each output in the unsigned transaction.
     pub outputs: Vec<Output>,
+
+    // PsbtV2 fields
+    /// 32-bit little endian signed integer representing the
+    /// version number of the transaction being created
+    pub tx_version: Option<i32>,
+    /// 32-bit little endian unsigned integer representing the transaction locktime
+    /// to use if no inputs specify a required locktime.
+    pub fallback_locktime: Option<u32>,
+    /// 8 bit unsigned integer as a bitfield for various transaction modification flags
+    pub tx_modifiable: Option<u8>, // or, Option<TxModifiable>
 }
 
-impl PartiallySignedTransaction {
+impl PsbtInner {
     /// Returns an iterator for the funding UTXOs of the psbt
     ///
     /// For each PSBT input that contains UTXO information `Ok` is returned containing that information.
@@ -143,21 +150,25 @@ impl PartiallySignedTransaction {
         Ok(())
     }
 
-    /// Creates a PSBT from an unsigned transaction.
+    /// Creates a PSBTV0 from an unsigned transaction.
     ///
     /// # Errors
     ///
     /// If transactions is not unsigned.
     pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, Error> {
-        let psbt = PartiallySignedTransaction {
+        let psbt = PsbtInner {
             inputs: vec![Default::default(); tx.input.len()],
             outputs: vec![Default::default(); tx.output.len()],
 
-            unsigned_tx: tx,
+            unsigned_tx: Some(tx),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
+
+            tx_version: None,
+            fallback_locktime: None,
+            tx_modifiable: None,
         };
         psbt.unsigned_tx_checks()?;
         Ok(psbt)
@@ -175,7 +186,7 @@ impl PartiallySignedTransaction {
         tx
     }
 
-    /// Combines this [`PartiallySignedTransaction`] with `other` PSBT as described by BIP 174.
+    /// Combines this [`PsbtInner`] with `other` PSBT as described by BIP 174.
     ///
     /// In accordance with BIP 174 this function is commutative i.e., `A.combine(B) == B.combine(A)`
     pub fn combine(&mut self, other: Self) -> Result<(), Error> {
@@ -507,6 +518,34 @@ impl PartiallySignedTransaction {
     }
 }
 
+/// Partially signed transaction, commonly referred to as a PSBT.
+pub struct Psbt {
+    inner: PsbtInner,
+}
+
+impl Psbt {
+    /// Builds a validated `Psbt` from the given `PsbtInner`
+    pub fn from_inner(psbt: PsbtInner) -> Result<Psbt, Error> {
+        match Self::validate_inner(&psbt) {
+            Ok(()) => Ok(Psbt { inner: psbt }),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Validates the given `PsbtInner` according to its version
+    pub fn validate_inner(psbt: &PsbtInner) -> Result<(), Error> {
+        match psbt.version {
+            Version::PsbtV0 => {
+                // Validate the inner as PsbtV0
+            }
+            Version::PsbtV2 => {
+                // Validate the inner as PsbtV2
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Data required to call [`GetKey`] to get the private key to sign an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -751,8 +790,9 @@ impl fmt::Display for SignError {
             SighashComputation(e) => write!(f, "sighash: {}", e),
             UnknownOutputType => write!(f, "unable to determine the output type"),
             KeyNotFound => write!(f, "unable to find key"),
-            WrongSigningAlgorithm =>
-                write!(f, "attempt to sign an input with the wrong signing algorithm"),
+            WrongSigningAlgorithm => {
+                write!(f, "attempt to sign an input with the wrong signing algorithm")
+            }
             Unsupported => write!(f, "signing request currently unsupported"),
         }
     }
@@ -783,7 +823,9 @@ impl std::error::Error for SignError {
 }
 
 impl From<sighash::Error> for SignError {
-    fn from(e: sighash::Error) -> Self { SignError::SighashComputation(e) }
+    fn from(e: sighash::Error) -> Self {
+        SignError::SighashComputation(e)
+    }
 }
 
 #[cfg(feature = "base64")]
@@ -794,7 +836,7 @@ mod display_from_str {
     use base64::display::Base64Display;
     use internals::write_err;
 
-    use super::{Error, PartiallySignedTransaction};
+    use super::{Error, PsbtInner};
     use crate::psbt::FutureVersionError;
 
     /// Error encountered during PSBT decoding from Base64 string.
@@ -834,18 +876,18 @@ mod display_from_str {
         }
     }
 
-    impl Display for PartiallySignedTransaction {
+    impl Display for PsbtInner {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             write!(f, "{}", Base64Display::with_config(&self.serialize(), base64::STANDARD))
         }
     }
 
-    impl FromStr for PartiallySignedTransaction {
+    impl FromStr for PsbtInner {
         type Err = PsbtParseError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             let data = base64::decode(s).map_err(PsbtParseError::Base64Encoding)?;
-            PartiallySignedTransaction::deserialize(&data).map_err(PsbtParseError::PsbtEncoding)
+            PsbtInner::deserialize(&data).map_err(PsbtParseError::PsbtEncoding)
         }
     }
 }
@@ -875,13 +917,13 @@ mod tests {
 
     #[test]
     fn trivial_psbt() {
-        let psbt = PartiallySignedTransaction {
-            unsigned_tx: Transaction {
+        let psbt = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::ZERO,
                 input: vec![],
                 output: vec![],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
@@ -889,13 +931,17 @@ mod tests {
 
             inputs: vec![],
             outputs: vec![],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         assert_eq!(psbt.serialize_hex(), "70736274ff01000a0200000000000000000000");
     }
 
     #[test]
     fn psbt_uncompressed_key() {
-        let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff01003302000000010000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff000000000000420204bb0d5d0cca36e7b9c80f63bc04c1240babb83bcd2803ef7ac8b6e2af594291daec281e856c98d210c5ab14dfd5828761f8ee7d5f45ca21ad3e4c4b41b747a3a047304402204f67e2afb76142d44fae58a2495d33a3419daa26cd0db8d04f3452b63289ac0f022010762a9fb67e94cc5cad9026f6dc99ff7f070f4278d30fbc7d0c869dd38c7fe70100").unwrap();
+        let psbt: PsbtInner = hex_psbt!("70736274ff01003302000000010000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff000000000000420204bb0d5d0cca36e7b9c80f63bc04c1240babb83bcd2803ef7ac8b6e2af594291daec281e856c98d210c5ab14dfd5828761f8ee7d5f45ca21ad3e4c4b41b747a3a047304402204f67e2afb76142d44fae58a2495d33a3419daa26cd0db8d04f3452b63289ac0f022010762a9fb67e94cc5cad9026f6dc99ff7f070f4278d30fbc7d0c869dd38c7fe70100").unwrap();
 
         assert!(psbt.inputs[0].partial_sigs.len() == 1);
         let pk = psbt.inputs[0].partial_sigs.iter().next().unwrap().0;
@@ -948,8 +994,8 @@ mod tests {
 
     #[test]
     fn serialize_then_deserialize_global() {
-        let expected = PartiallySignedTransaction {
-            unsigned_tx: Transaction {
+        let expected = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![TxIn {
@@ -979,13 +1025,17 @@ mod tests {
                         .unwrap(),
                     },
                 ],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: Default::default(),
             unknown: Default::default(),
             inputs: vec![Input::default()],
             outputs: vec![Output::default(), Output::default()],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
 
         let actual: Psbt = Psbt::deserialize(&expected.serialize()).unwrap();
@@ -1007,7 +1057,7 @@ mod tests {
     #[test]
     fn deserialize_and_serialize_psbt_with_two_partial_sigs() {
         let hex = "70736274ff0100890200000001207ae985d787dfe6143d5c58fad79cc7105e0e799fcf033b7f2ba17e62d7b3200000000000ffffffff02563d03000000000022002019899534b9a011043c0dd57c3ff9a381c3522c5f27c6a42319085b56ca543a1d6adc020000000000220020618b47a07ebecca4e156edb1b9ea7c24bdee0139fc049237965ffdaf56d5ee73000000000001012b801a0600000000002200201148e93e9315e37dbed2121be5239257af35adc03ffdfc5d914b083afa44dab82202025fe7371376d53cf8a2783917c28bf30bd690b0a4d4a207690093ca2b920ee076473044022007e06b362e89912abd4661f47945430739b006a85d1b2a16c01dc1a4bd07acab022061576d7aa834988b7ab94ef21d8eebd996ea59ea20529a19b15f0c9cebe3d8ac01220202b3fe93530020a8294f0e527e33fbdff184f047eb6b5a1558a352f62c29972f8a473044022002787f926d6817504431ee281183b8119b6845bfaa6befae45e13b6d430c9d2f02202859f149a6cd26ae2f03a107e7f33c7d91730dade305fe077bae677b5d44952a01010547522102b3fe93530020a8294f0e527e33fbdff184f047eb6b5a1558a352f62c29972f8a21025fe7371376d53cf8a2783917c28bf30bd690b0a4d4a207690093ca2b920ee07652ae0001014752210283ef76537f2d58ae3aa3a4bd8ae41c3f230ccadffb1a0bd3ca504d871cff05e7210353d79cc0cb1396f4ce278d005f16d948e02a6aec9ed1109f13747ecb1507b37b52ae00010147522102b3937241777b6665e0d694e52f9c1b188433641df852da6fc42187b5d8a368a321034cdd474f01cc5aa7ff834ad8bcc882a87e854affc775486bc2a9f62e8f49bd7852ae00";
-        let psbt: PartiallySignedTransaction = hex_psbt!(hex).unwrap();
+        let psbt: PsbtInner = hex_psbt!(hex).unwrap();
         assert_eq!(hex, psbt.serialize_hex());
     }
 
@@ -1068,7 +1118,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let psbt = PartiallySignedTransaction {
+        let psbt = PsbtInner {
             version: Version::PsbtV0,
             xpub: {
                 let xpub: ExtendedPubKey =
@@ -1076,12 +1126,12 @@ mod tests {
                     QfrDb27gigC1VS1dBXi5jGpxmMeBXEkKkcXUTg4".parse().unwrap();
                 vec![(xpub, key_source)].into_iter().collect()
             },
-            unsigned_tx: {
+            unsigned_tx: Some({
                 let mut unsigned = tx.clone();
                 unsigned.input[0].script_sig = ScriptBuf::new();
                 unsigned.input[0].witness = Witness::default();
                 unsigned
-            },
+            }),
             proprietary: proprietary.clone(),
             unknown: unknown.clone(),
 
@@ -1118,9 +1168,13 @@ mod tests {
                     ..Default::default()
                 }
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         let encoded = serde_json::to_string(&psbt).unwrap();
-        let decoded: PartiallySignedTransaction = serde_json::from_str(&encoded).unwrap();
+        let decoded: PsbtInner = serde_json::from_str(&encoded).unwrap();
         assert_eq!(psbt, decoded);
     }
 
@@ -1133,10 +1187,10 @@ mod tests {
         use crate::blockdata::locktime::absolute;
         use crate::blockdata::script::ScriptBuf;
         use crate::blockdata::transaction::{OutPoint, Sequence, Transaction, TxIn, TxOut};
-        use crate::psbt::map::{Map, Input, Output};
-        use crate::psbt::{raw, Error, PartiallySignedTransaction};
-        use crate::sighash::EcdsaSighashType;
         use crate::blockdata::witness::Witness;
+        use crate::psbt::map::{Input, Map, Output};
+        use crate::psbt::{raw, Error, PsbtInner};
+        use crate::sighash::EcdsaSighashType;
 
         #[test]
         #[should_panic(expected = "InvalidMagic")]
@@ -1148,7 +1202,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "InvalidMagic")]
         fn invalid_vector_1_base64() {
-            PartiallySignedTransaction::from_str("AgAAAAEmgXE3Ht/yhek3re6ks3t4AAwFZsuzrWRkFxPKQhcb9gAAAABqRzBEAiBwsiRRI+a/R01gxbUMBD1MaRpdJDXwmjSnZiqdwlF5CgIgATKcqdrPKAvfMHQOwDkEIkIsgctFg5RXrrdvwS7dlbMBIQJlfRGNM1e44PTCzUbbezn22cONmnCry5st5dyNv+TOMf7///8C09/1BQAAAAAZdqkU0MWZA8W6woaHYOkP1SGkZlqnZSCIrADh9QUAAAAAF6kUNUXm4zuDLEcFDyTT7rk8nAOUi8eHsy4TAA==").unwrap();
+            PsbtInner::from_str("AgAAAAEmgXE3Ht/yhek3re6ks3t4AAwFZsuzrWRkFxPKQhcb9gAAAABqRzBEAiBwsiRRI+a/R01gxbUMBD1MaRpdJDXwmjSnZiqdwlF5CgIgATKcqdrPKAvfMHQOwDkEIkIsgctFg5RXrrdvwS7dlbMBIQJlfRGNM1e44PTCzUbbezn22cONmnCry5st5dyNv+TOMf7///8C09/1BQAAAAAZdqkU0MWZA8W6woaHYOkP1SGkZlqnZSCIrADh9QUAAAAAF6kUNUXm4zuDLEcFDyTT7rk8nAOUi8eHsy4TAA==").unwrap();
         }
 
         #[test]
@@ -1165,7 +1219,7 @@ mod tests {
         #[should_panic(expected = "ConsensusEncoding")]
         fn invalid_vector_2_base64() {
             use crate::psbt::PsbtParseError;
-            PartiallySignedTransaction::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==")
+            PsbtInner::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==")
                 // This weird thing is necessary since rustc 0.29 prints out I/O error in a different format than later versions
                 .map_err(|err| match err {
                     PsbtParseError::PsbtEncoding(err) => err,
@@ -1186,7 +1240,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "UnsignedTxHasScriptSigs")]
         fn invalid_vector_3_base64() {
-            PartiallySignedTransaction::from_str("cHNidP8BAP0KAQIAAAACqwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QAAAAAakcwRAIgR1lmF5fAGwNrJZKJSGhiGDR9iYZLcZ4ff89X0eURZYcCIFMJ6r9Wqk2Ikf/REf3xM286KdqGbX+EhtdVRs7tr5MZASEDXNxh/HupccC1AaZGoqg7ECy0OIEhfKaC3Ibi1z+ogpL+////qwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QBAAAAAP7///8CYDvqCwAAAAAZdqkUdopAu9dAy+gdmI5x3ipNXHE5ax2IrI4kAAAAAAAAGXapFG9GILVT+glechue4O/p+gOcykWXiKwAAAAAAAABASAA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHhwEEFgAUhdE1N/LiZUBaNNuvqePdoB+4IwgAAAA=").unwrap();
+            PsbtInner::from_str("cHNidP8BAP0KAQIAAAACqwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QAAAAAakcwRAIgR1lmF5fAGwNrJZKJSGhiGDR9iYZLcZ4ff89X0eURZYcCIFMJ6r9Wqk2Ikf/REf3xM286KdqGbX+EhtdVRs7tr5MZASEDXNxh/HupccC1AaZGoqg7ECy0OIEhfKaC3Ibi1z+ogpL+////qwlJoIxa98SbghL0F+LxWrP1wz3PFTghqBOfh3pbe+QBAAAAAP7///8CYDvqCwAAAAAZdqkUdopAu9dAy+gdmI5x3ipNXHE5ax2IrI4kAAAAAAAAGXapFG9GILVT+glechue4O/p+gOcykWXiKwAAAAAAAABASAA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHhwEEFgAUhdE1N/LiZUBaNNuvqePdoB+4IwgAAAA=").unwrap();
         }
 
         #[test]
@@ -1199,7 +1253,7 @@ mod tests {
         #[test]
         #[should_panic(expected = "MustHaveUnsignedTx")]
         fn invalid_vector_4_base64() {
-            PartiallySignedTransaction::from_str("cHNidP8AAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==").unwrap();
+            PsbtInner::from_str("cHNidP8AAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAA==").unwrap();
         }
 
         #[test]
@@ -1212,13 +1266,13 @@ mod tests {
         #[test]
         #[should_panic(expected = "DuplicateKey(Key { type_value: 0, key: [] })")]
         fn invalid_vector_5_base64() {
-            PartiallySignedTransaction::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAQA/AgAAAAH//////////////////////////////////////////wAAAAAA/////wEAAAAAAAAAAANqAQAAAAAAAAAA").unwrap();
+            PsbtInner::from_str("cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAQA/AgAAAAH//////////////////////////////////////////wAAAAAA/////wEAAAAAAAAAAANqAQAAAAAAAAAA").unwrap();
         }
 
         #[test]
         fn valid_vector_1() {
-            let unserialized = PartiallySignedTransaction {
-                unsigned_tx: Transaction {
+            let unserialized = PsbtInner {
+                unsigned_tx: Some(Transaction {
                     version: 2,
                     lock_time: absolute::LockTime::from_consensus(1257139),
                     input: vec![
@@ -1242,7 +1296,7 @@ mod tests {
                             script_pubkey: ScriptBuf::from_hex("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787").unwrap(),
                         },
                     ],
-                },
+                }),
                 xpub: Default::default(),
                 version: Version::PsbtV0,
                 proprietary: BTreeMap::new(),
@@ -1301,6 +1355,10 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+
+                tx_modifiable: None,
+                tx_version: None,
+                fallback_locktime: None,
             };
 
             let base16str = "70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab300000000000000";
@@ -1311,18 +1369,15 @@ mod tests {
             #[cfg(feature = "base64")]
             {
                 let base64str = "cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////AtPf9QUAAAAAGXapFNDFmQPFusKGh2DpD9UhpGZap2UgiKwA4fUFAAAAABepFDVF5uM7gyxHBQ8k0+65PJwDlIvHh7MuEwAAAQD9pQEBAAAAAAECiaPHHqtNIOA3G7ukzGmPopXJRjr6Ljl/hTPMti+VZ+UBAAAAFxYAFL4Y0VKpsBIDna89p95PUzSe7LmF/////4b4qkOnHf8USIk6UwpyN+9rRgi7st0tAXHmOuxqSJC0AQAAABcWABT+Pp7xp0XpdNkCxDVZQ6vLNL1TU/////8CAMLrCwAAAAAZdqkUhc/xCX/Z4Ai7NK9wnGIZeziXikiIrHL++E4sAAAAF6kUM5cluiHv1irHU6m80GfWx6ajnQWHAkcwRAIgJxK+IuAnDzlPVoMR3HyppolwuAJf3TskAinwf4pfOiQCIAGLONfc0xTnNMkna9b7QPZzMlvEuqFEyADS8vAtsnZcASED0uFWdJQbrUqZY3LLh+GFbTZSYG2YVi/jnF6efkE/IQUCSDBFAiEA0SuFLYXc2WHS9fSrZgZU327tzHlMDDPOXMMJ/7X85Y0CIGczio4OFyXBl/saiK9Z9R5E5CVbIBZ8hoQDHAXR8lkqASECI7cr7vCWXRC+B3jv7NYfysb3mk6haTkzgHNEZPhPKrMAAAAAAAAA";
-                assert_eq!(PartiallySignedTransaction::from_str(base64str).unwrap(), unserialized);
+                assert_eq!(PsbtInner::from_str(base64str).unwrap(), unserialized);
                 assert_eq!(base64str, unserialized.to_string());
-                assert_eq!(
-                    PartiallySignedTransaction::from_str(base64str).unwrap(),
-                    hex_psbt!(base16str).unwrap()
-                );
+                assert_eq!(PsbtInner::from_str(base64str).unwrap(), hex_psbt!(base16str).unwrap());
             }
         }
 
         #[test]
         fn valid_vector_2() {
-            let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac000000000001076a47304402204759661797c01b036b25928948686218347d89864b719e1f7fcf57d1e511658702205309eabf56aa4d8891ffd111fdf1336f3a29da866d7f8486d75546ceedaf93190121035cdc61fc7ba971c0b501a646a2a83b102cb43881217ca682dc86e2d73fa882920001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb82308000000").unwrap();
+            let psbt: PsbtInner = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac000000000001076a47304402204759661797c01b036b25928948686218347d89864b719e1f7fcf57d1e511658702205309eabf56aa4d8891ffd111fdf1336f3a29da866d7f8486d75546ceedaf93190121035cdc61fc7ba971c0b501a646a2a83b102cb43881217ca682dc86e2d73fa882920001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb82308000000").unwrap();
 
             assert_eq!(psbt.inputs.len(), 2);
             assert_eq!(psbt.outputs.len(), 2);
@@ -1347,7 +1402,7 @@ mod tests {
 
         #[test]
         fn valid_vector_3() {
-            let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab30000000001030401000000000000").unwrap();
+            let psbt: PsbtInner = hex_psbt!("70736274ff0100750200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf60000000000feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e1300000100fda5010100000000010289a3c71eab4d20e0371bbba4cc698fa295c9463afa2e397f8533ccb62f9567e50100000017160014be18d152a9b012039daf3da7de4f53349eecb985ffffffff86f8aa43a71dff1448893a530a7237ef6b4608bbb2dd2d0171e63aec6a4890b40100000017160014fe3e9ef1a745e974d902c4355943abcb34bd5353ffffffff0200c2eb0b000000001976a91485cff1097fd9e008bb34af709c62197b38978a4888ac72fef84e2c00000017a914339725ba21efd62ac753a9bcd067d6c7a6a39d05870247304402202712be22e0270f394f568311dc7ca9a68970b8025fdd3b240229f07f8a5f3a240220018b38d7dcd314e734c9276bd6fb40f673325bc4baa144c800d2f2f02db2765c012103d2e15674941bad4a996372cb87e1856d3652606d98562fe39c5e9e7e413f210502483045022100d12b852d85dcd961d2f5f4ab660654df6eedcc794c0c33ce5cc309ffb5fce58d022067338a8e0e1725c197fb1a88af59f51e44e4255b20167c8684031c05d1f2592a01210223b72beef0965d10be0778efecd61fcac6f79a4ea169393380734464f84f2ab30000000001030401000000000000").unwrap();
 
             assert_eq!(psbt.inputs.len(), 1);
             assert_eq!(psbt.outputs.len(), 2);
@@ -1367,7 +1422,7 @@ mod tests {
 
         #[test]
         fn valid_vector_4() {
-            let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac00000000000100df0200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf6000000006a473044022070b2245123e6bf474d60c5b50c043d4c691a5d2435f09a34a7662a9dc251790a022001329ca9dacf280bdf30740ec0390422422c81cb45839457aeb76fc12edd95b3012102657d118d3357b8e0f4c2cd46db7b39f6d9c38d9a70abcb9b2de5dc8dbfe4ce31feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e13000001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb8230800220202ead596687ca806043edc3de116cdf29d5e9257c196cd055cf698c8d02bf24e9910b4a6ba670000008000000080020000800022020394f62be9df19952c5587768aeb7698061ad2c4a25c894f47d8c162b4d7213d0510b4a6ba6700000080010000800200008000").unwrap();
+            let psbt: PsbtInner = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac00000000000100df0200000001268171371edff285e937adeea4b37b78000c0566cbb3ad64641713ca42171bf6000000006a473044022070b2245123e6bf474d60c5b50c043d4c691a5d2435f09a34a7662a9dc251790a022001329ca9dacf280bdf30740ec0390422422c81cb45839457aeb76fc12edd95b3012102657d118d3357b8e0f4c2cd46db7b39f6d9c38d9a70abcb9b2de5dc8dbfe4ce31feffffff02d3dff505000000001976a914d0c59903c5bac2868760e90fd521a4665aa7652088ac00e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787b32e13000001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb8230800220202ead596687ca806043edc3de116cdf29d5e9257c196cd055cf698c8d02bf24e9910b4a6ba670000008000000080020000800022020394f62be9df19952c5587768aeb7698061ad2c4a25c894f47d8c162b4d7213d0510b4a6ba6700000080010000800200008000").unwrap();
 
             assert_eq!(psbt.inputs.len(), 2);
             assert_eq!(psbt.outputs.len(), 2);
@@ -1393,7 +1448,7 @@ mod tests {
 
         #[test]
         fn valid_vector_5() {
-            let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff0100550200000001279a2323a5dfb51fc45f220fa58b0fc13e1e3342792a85d7e36cd6333b5cbc390000000000ffffffff01a05aea0b000000001976a914ffe9c0061097cc3b636f2cb0460fa4fc427d2b4588ac0000000000010120955eea0b0000000017a9146345200f68d189e1adc0df1c4d16ea8f14c0dbeb87220203b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4646304302200424b58effaaa694e1559ea5c93bbfd4a89064224055cdf070b6771469442d07021f5c8eb0fea6516d60b8acb33ad64ede60e8785bfb3aa94b99bdf86151db9a9a010104220020771fd18ad459666dd49f3d564e3dbc42f4c84774e360ada16816a8ed488d5681010547522103b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd462103de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd52ae220603b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4610b4a6ba67000000800000008004000080220603de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd10b4a6ba670000008000000080050000800000").unwrap();
+            let psbt: PsbtInner = hex_psbt!("70736274ff0100550200000001279a2323a5dfb51fc45f220fa58b0fc13e1e3342792a85d7e36cd6333b5cbc390000000000ffffffff01a05aea0b000000001976a914ffe9c0061097cc3b636f2cb0460fa4fc427d2b4588ac0000000000010120955eea0b0000000017a9146345200f68d189e1adc0df1c4d16ea8f14c0dbeb87220203b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4646304302200424b58effaaa694e1559ea5c93bbfd4a89064224055cdf070b6771469442d07021f5c8eb0fea6516d60b8acb33ad64ede60e8785bfb3aa94b99bdf86151db9a9a010104220020771fd18ad459666dd49f3d564e3dbc42f4c84774e360ada16816a8ed488d5681010547522103b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd462103de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd52ae220603b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4610b4a6ba67000000800000008004000080220603de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd10b4a6ba670000008000000080050000800000").unwrap();
 
             assert_eq!(psbt.inputs.len(), 1);
             assert_eq!(psbt.outputs.len(), 1);
@@ -1415,7 +1470,7 @@ mod tests {
 
         #[test]
         fn valid_vector_6() {
-            let psbt: PartiallySignedTransaction = hex_psbt!("70736274ff01003f0200000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000ffffffff010000000000000000036a010000000000000a0f0102030405060708090f0102030405060708090a0b0c0d0e0f0000").unwrap();
+            let psbt: PsbtInner = hex_psbt!("70736274ff01003f0200000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000ffffffff010000000000000000036a010000000000000a0f0102030405060708090f0102030405060708090a0b0c0d0e0f0000").unwrap();
 
             assert_eq!(psbt.inputs.len(), 1);
             assert_eq!(psbt.outputs.len(), 1);
@@ -1484,7 +1539,7 @@ mod tests {
             assert_eq!(err.to_string(), "invalid control block");
         }
 
-        fn rtt_psbt(psbt: PartiallySignedTransaction) {
+        fn rtt_psbt(psbt: PsbtInner) {
             let enc = Psbt::serialize(&psbt);
             let psbt2 = Psbt::deserialize(&enc).unwrap();
             assert_eq!(psbt, psbt2);
@@ -1549,8 +1604,8 @@ mod tests {
         hash160_preimages.insert(hash160::Hash::hash(&[1u8]), vec![1u8]);
 
         // same vector as valid_vector_1 from BIPs with added
-        let mut unserialized = PartiallySignedTransaction {
-            unsigned_tx: Transaction {
+        let mut unserialized = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![
@@ -1574,7 +1629,7 @@ mod tests {
                         script_pubkey: ScriptBuf::from_hex("a9143545e6e33b832c47050f24d3eeb93c9c03948bc787").unwrap(),
                     },
                 ],
-            },
+            }),
             version: Version::PsbtV0,
             xpub: Default::default(),
             proprietary: Default::default(),
@@ -1633,11 +1688,15 @@ mod tests {
                     ..Default::default()
                 },
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         unserialized.inputs[0].hash160_preimages = hash160_preimages;
         unserialized.inputs[0].sha256_preimages = sha256_preimages;
 
-        let rtt: PartiallySignedTransaction = hex_psbt!(&unserialized.serialize_hex()).unwrap();
+        let rtt: PsbtInner = hex_psbt!(&unserialized.serialize_hex()).unwrap();
         assert_eq!(rtt, unserialized);
 
         // Now add an ripemd160 with incorrect preimage
@@ -1646,19 +1705,19 @@ mod tests {
         unserialized.inputs[0].ripemd160_preimages = ripemd160_preimages;
 
         // Now the roundtrip should fail as the preimage is incorrect.
-        let rtt: Result<PartiallySignedTransaction, _> = hex_psbt!(&unserialized.serialize_hex());
+        let rtt: Result<PsbtInner, _> = hex_psbt!(&unserialized.serialize_hex());
         assert!(rtt.is_err());
     }
 
     #[test]
     fn serialize_and_deserialize_proprietary() {
-        let mut psbt: PartiallySignedTransaction = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac000000000001076a47304402204759661797c01b036b25928948686218347d89864b719e1f7fcf57d1e511658702205309eabf56aa4d8891ffd111fdf1336f3a29da866d7f8486d75546ceedaf93190121035cdc61fc7ba971c0b501a646a2a83b102cb43881217ca682dc86e2d73fa882920001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb82308000000").unwrap();
+        let mut psbt: PsbtInner = hex_psbt!("70736274ff0100a00200000002ab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40000000000feffffffab0949a08c5af7c49b8212f417e2f15ab3f5c33dcf153821a8139f877a5b7be40100000000feffffff02603bea0b000000001976a914768a40bbd740cbe81d988e71de2a4d5c71396b1d88ac8e240000000000001976a9146f4620b553fa095e721b9ee0efe9fa039cca459788ac000000000001076a47304402204759661797c01b036b25928948686218347d89864b719e1f7fcf57d1e511658702205309eabf56aa4d8891ffd111fdf1336f3a29da866d7f8486d75546ceedaf93190121035cdc61fc7ba971c0b501a646a2a83b102cb43881217ca682dc86e2d73fa882920001012000e1f5050000000017a9143545e6e33b832c47050f24d3eeb93c9c03948bc787010416001485d13537f2e265405a34dbafa9e3dda01fb82308000000").unwrap();
         psbt.proprietary.insert(
             raw::ProprietaryKey { prefix: b"test".to_vec(), subtype: 0u8, key: b"test".to_vec() },
             b"test".to_vec(),
         );
         assert!(!psbt.proprietary.is_empty());
-        let rtt: PartiallySignedTransaction = hex_psbt!(&psbt.serialize_hex()).unwrap();
+        let rtt: PsbtInner = hex_psbt!(&psbt.serialize_hex()).unwrap();
         assert!(!rtt.proprietary.is_empty());
     }
 
@@ -1718,8 +1777,8 @@ mod tests {
         let output_1_val = Amount::from_sat(100_000_000);
         let prev_output_val = Amount::from_sat(200_000_000);
 
-        let mut t = PartiallySignedTransaction {
-            unsigned_tx: Transaction {
+        let mut t = PsbtInner {
+            unsigned_tx: Some(Transaction {
                 version: 2,
                 lock_time: absolute::LockTime::from_consensus(1257139),
                 input: vec![
@@ -1742,7 +1801,7 @@ mod tests {
                         script_pubkey:  ScriptBuf::new()
                     },
                 ],
-            },
+            }),
             xpub: Default::default(),
             version: Version::PsbtV0,
             proprietary: BTreeMap::new(),
@@ -1793,6 +1852,10 @@ mod tests {
                     ..Default::default()
                 },
             ],
+
+            tx_modifiable: None,
+            tx_version: None,
+            fallback_locktime: None,
         };
         assert_eq!(
             t.fee().expect("fee calculation"),
@@ -1834,7 +1897,7 @@ mod tests {
             input: vec![TxIn::default(), TxIn::default()],
             output: vec![TxOut::NULL],
         };
-        let mut psbt = PartiallySignedTransaction::from_unsigned_tx(unsigned_tx).unwrap();
+        let mut psbt = PsbtInner::from_unsigned_tx(unsigned_tx).unwrap();
 
         let (priv_key, pk, secp) = gen_keys();
 
