@@ -15,7 +15,7 @@ use crate::blockdata::transaction::{Transaction, TxOut};
 use crate::blockdata::witness::Witness;
 use crate::crypto::key::PublicKey;
 use crate::crypto::{ecdsa, taproot};
-use crate::prelude::*;
+use crate::{prelude::*, absolute};
 use crate::psbt::map::Map;
 use crate::psbt::serialize::Deserialize;
 use crate::psbt::{self, error, raw, Error};
@@ -148,10 +148,10 @@ pub struct Input {
     pub sequence: Option<Sequence>,
     /// Represents the minimum UNIX timestamp to set as the lock time for this transaction.
     /// Optional in PSBTv2, not allowed in PSBTv0.
-    pub required_time_locktime: Option<u32>,
+    pub time_lock_time: Option<absolute::LockTime>,
     /// Represents the minimum block height required to be set as the transaction’s lock time.
     /// Optional in PSBTv2, not allowed in PSBTv0.
-    pub required_height_locktime: Option<u32>,
+    pub height_lock_time: Option<absolute::LockTime>,
 }
 
 /// A Signature hash type for the corresponding input. As of taproot upgrade, the signature hash

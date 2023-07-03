@@ -106,8 +106,6 @@ pub enum Error {
     Io(io::Error),
 
     // PsbtV0 field Errors
-    /// Unsigned Transaction not present in PsbtV0
-    MissingUnsignedTx,
     /// Transaction Version is not allowed in PsbtV0
     TxVersionPresent,
     /// Fallback Locktime is not allowed in PsbtV0
@@ -120,6 +118,8 @@ pub enum Error {
     MissingTxVersion,
     /// Unsigned Transaction is not allowed in PsbtV2
     UnsignedTxPresent,
+    /// Output Index not present in Input
+    OutputIndexNotPresent,
 }
 
 impl fmt::Display for Error {
@@ -177,12 +177,12 @@ impl fmt::Display for Error {
             Error::PartialDataConsumption =>
                 f.write_str("data not consumed entirely when explicitly deserializing"),
             Error::Io(ref e) => write_err!(f, "I/O error"; e),
-            Error::MissingUnsignedTx => f.write_str("unsigned transaction is required in PsbtV0"),
             Error::TxVersionPresent => f.write_str("transaction version not allowed in PsbtV0"),
             Error::FallbackLocktimePresent => f.write_str("fallback locktime not allowed in PsbtV0"),
             Error::TxModifiablePresent => f.write_str("TxModifiable not allowed in PsbtV0"),
             Error::MissingTxVersion => f.write_str("transaction version is required in PsbtV2"),
             Error::UnsignedTxPresent => f.write_str("unsigned transaction not allowed in PsbtV2"),
+            Error::OutputIndexNotPresent => f.write_str("output index not present in the PsbtV2 input"),
         }
     }
 }
@@ -226,12 +226,12 @@ impl std::error::Error for Error {
             | XPubKey(_)
             | Version(_)
             | PartialDataConsumption
-            | MissingUnsignedTx
             | TxVersionPresent
             | FallbackLocktimePresent
             | TxModifiablePresent
             | MissingTxVersion
-            | UnsignedTxPresent => None,
+            | UnsignedTxPresent
+            | OutputIndexNotPresent => None,
         }
     }
 }

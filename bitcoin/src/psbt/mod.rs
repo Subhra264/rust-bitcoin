@@ -7,7 +7,7 @@
 //! except we define PSBTs containing non-standard sighash types as invalid.
 //!
 
-use core::{cmp, fmt};
+use core::fmt;
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +15,8 @@ use internals::write_err;
 use secp256k1::{Message, Secp256k1, Signing};
 
 use crate::bip32::{self, ExtendedPrivKey, ExtendedPubKey, KeySource};
-use crate::blockdata::transaction::{Transaction, TxOut};
+use crate::blockdata::locktime::absolute;
+use crate::blockdata::transaction::{Transaction, TxIn, TxOut, OutPoint};
 use crate::crypto::ecdsa;
 use crate::crypto::key::{PrivateKey, PublicKey};
 use crate::prelude::*;
@@ -82,6 +83,16 @@ pub struct TxModifiable {
     // More flags
 }
 
+impl TxModifiable {
+    fn to_raw(self) -> u8 {
+        let mut byte: u8 = 0x00;
+        byte |= self.input_modifiable as u8;
+        byte |= (self.output_modifiable as u8) << 1;
+        byte |= (self.has_sighash_single as u8) << 2;
+        byte
+    }
+}
+
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -112,7 +123,7 @@ pub struct PsbtInner {
     pub tx_version: Option<i32>,
     /// 32-bit little endian unsigned integer representing the transaction locktime
     /// to use if no inputs specify a required locktime.
-    pub fallback_locktime: Option<u32>,
+    pub fallback_locktime: Option<absolute::LockTime>,
     /// PSBTv2 field for various transaction modification flags
     pub tx_modifiable: Option<TxModifiable>,
 }
@@ -125,7 +136,7 @@ impl PsbtInner {
                 // Validate the inner as PsbtV0
                 // unsigned_tx --> required
                 if self.unsigned_tx == None {
-                    return Err(Error::MissingUnsignedTx);
+                    return Err(Error::MustHaveUnsignedTx);
                 }
 
                 // tx_version --> None
@@ -161,6 +172,50 @@ impl PsbtInner {
         }
 
         Ok(())
+    }
+
+    /// Checks that unsigned transaction does not have scriptSig's or witness data.
+    fn unsigned_tx_checks(&self) -> Result<(), Error> {
+        match self.unsigned_tx.as_ref() {
+            Some(unsigned_tx) => {
+                for txin in &unsigned_tx.input {
+                    if !txin.script_sig.is_empty() {
+                        return Err(Error::UnsignedTxHasScriptSigs);
+                    }
+        
+                    if !txin.witness.is_empty() {
+                        return Err(Error::UnsignedTxHasScriptWitnesses);
+                    }
+                }
+        
+                Ok(())
+            },
+            None => Err(Error::MustHaveUnsignedTx)
+        }
+    }
+
+    /// Creates a PsbtV0 from an unsigned transaction.
+    ///
+    /// # Errors
+    ///
+    /// If transactions is not unsigned.
+    pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, Error> {
+        let psbt = PsbtInner {
+            inputs: vec![Default::default(); tx.input.len()],
+            outputs: vec![Default::default(); tx.output.len()],
+
+            unsigned_tx: Some(tx),
+            xpub: Default::default(),
+            version: Version::PsbtV0,
+            proprietary: Default::default(),
+            unknown: Default::default(),
+
+            tx_version: None,
+            fallback_locktime: None,
+            tx_modifiable: None,
+        };
+        psbt.unsigned_tx_checks()?;
+        Ok(psbt)
     }
 }
 
@@ -200,135 +255,229 @@ impl Psbt {
     /// ## Panics
     ///
     /// The function panics if the length of transaction inputs is not equal to the length of PSBT inputs.
-    pub fn iter_funding_utxos(&self) -> impl Iterator<Item = Result<&TxOut, Error>> {
-        assert_eq!(self.inputs.len(), self.unsigned_tx.input.len());
-        self.unsigned_tx.input.iter().zip(&self.inputs).map(|(tx_input, psbt_input)| {
-            match (&psbt_input.witness_utxo, &psbt_input.non_witness_utxo) {
-                (Some(witness_utxo), _) => Ok(witness_utxo),
-                (None, Some(non_witness_utxo)) => {
-                    let vout = tx_input.previous_output.vout as usize;
-                    non_witness_utxo.output.get(vout).ok_or(Error::PsbtUtxoOutOfbounds)
-                }
-                (None, None) => Err(Error::MissingUtxo),
-            }
-        })
-    }
-
-    /// Checks that unsigned transaction does not have scriptSig's or witness data.
-    fn unsigned_tx_checks(&self) -> Result<(), Error> {
-        for txin in &self.unsigned_tx.input {
-            if !txin.script_sig.is_empty() {
-                return Err(Error::UnsignedTxHasScriptSigs);
-            }
-
-            if !txin.witness.is_empty() {
-                return Err(Error::UnsignedTxHasScriptWitnesses);
+    pub fn iter_funding_utxos(&self) -> Box<dyn Iterator<Item = Result<&TxOut, Error>>> {
+        let inner = &self.inner;
+        match inner.version {
+            Version::PsbtV0 => {
+                let unsigned_tx = inner.unsigned_tx.as_ref().unwrap();
+                assert_eq!(inner.inputs.len(), unsigned_tx.input.len());
+                Box::new(unsigned_tx.input.iter().zip(&inner.inputs).map(|(tx_input, psbt_input)| {
+                    match (&psbt_input.witness_utxo, &psbt_input.non_witness_utxo) {
+                        (Some(witness_utxo), _) => Ok(witness_utxo),
+                        (None, Some(non_witness_utxo)) => {
+                            let vout = tx_input.previous_output.vout as usize;
+                            non_witness_utxo.output.get(vout).ok_or(Error::PsbtUtxoOutOfbounds)
+                        }
+                        (None, None) => Err(Error::MissingUtxo),
+                    }
+                })) as Box<dyn Iterator<Item = Result<&TxOut, Error>>>
+            },
+            Version::PsbtV2 => {
+                // In PsbtV2, Input contains all the details, no need of unsigned_tx
+                Box::new(inner.inputs.iter().map(|input| {
+                    match (&input.witness_utxo, &input.non_witness_utxo) {
+                        (Some(witness_utxo), _) => Ok(witness_utxo),
+                        (None, Some(non_witness_utxo)) => {
+                            let output_index = input.output_index.unwrap() as usize;
+                            non_witness_utxo.output.get(output_index).ok_or(Error::PsbtUtxoOutOfbounds)
+                        }
+                        (None, None) => Err(Error::MissingUtxo),
+                    }
+                })) as Box<dyn Iterator<Item = Result<&TxOut, Error>>>
             }
         }
-
-        Ok(())
-    }
-
-    /// Creates a PSBTV0 from an unsigned transaction.
-    ///
-    /// # Errors
-    ///
-    /// If transactions is not unsigned.
-    pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, Error> {
-        let psbt = PsbtInner {
-            inputs: vec![Default::default(); tx.input.len()],
-            outputs: vec![Default::default(); tx.output.len()],
-
-            unsigned_tx: Some(tx),
-            xpub: Default::default(),
-            version: Version::PsbtV0,
-            proprietary: Default::default(),
-            unknown: Default::default(),
-
-            tx_version: None,
-            fallback_locktime: None,
-            tx_modifiable: None,
-        };
-        psbt.unsigned_tx_checks()?;
-        Ok(psbt)
     }
 
     /// Extracts the `Transaction` from a PSBT by filling in the available signature information.
     pub fn extract_tx(self) -> Transaction {
-        let mut tx: Transaction = self.unsigned_tx;
+        let psbt_inner = self.inner;
 
-        for (vin, psbtin) in tx.input.iter_mut().zip(self.inputs.into_iter()) {
-            vin.script_sig = psbtin.final_script_sig.unwrap_or_default();
-            vin.witness = psbtin.final_script_witness.unwrap_or_default();
+        match psbt_inner.version {
+            Version::PsbtV0 => {
+                let mut tx: Transaction = psbt_inner.unsigned_tx.unwrap();
+
+                for (vin, psbtin) in tx.input.iter_mut().zip(psbt_inner.inputs.into_iter()) {
+                    vin.script_sig = psbtin.final_script_sig.unwrap_or_default();
+                    vin.witness = psbtin.final_script_witness.unwrap_or_default();
+                }
+
+                tx
+            },
+            Version::PsbtV2 => {
+                let mut tx = Transaction {
+                    version: psbt_inner.tx_version.unwrap(),
+                    lock_time: psbt_inner.fallback_locktime.unwrap_or(absolute::LockTime::ZERO),
+                    input: vec![],
+                    output: vec![],
+                };
+                let mut time_locktime: Option<absolute::LockTime> = None;
+                let mut height_locktime: Option<absolute::LockTime> = None;
+                let (mut time_flag, mut height_flag) = (true, true);
+
+                /// Calculates the max lock time and assigns it to the given locktime variable.
+                fn max_locktime(locktime: &mut Option<absolute::LockTime>, new_lock: absolute::LockTime) {
+                    match *locktime {
+                        None => { *locktime = Some(new_lock); },
+                        Some(lock) => {
+                            if lock >= new_lock {
+                                *locktime = Some(lock);
+                            } else {
+                                *locktime = Some(new_lock);
+                            }
+                        }
+                    }
+                }
+
+                for psbtin in psbt_inner.inputs.into_iter() {
+                    // See https://bips.xyz/370#determining-lock-time
+                    match (psbtin.time_lock_time, psbtin.height_lock_time) {
+                        (Some(lock), None) => {
+                            // Not Time, but Height lock time was supposed to be present
+                            if !time_flag {
+                                // TODO: What to do? panic?
+                                panic!("Height locktime needs to be supported by all inputs");
+                            }
+                            // Transaction can no longer contain height locktime
+                            height_flag = false;
+                            height_locktime = None;
+
+                            max_locktime(&mut time_locktime, lock);
+                        },
+                        (None, Some(lock)) => {
+                            // Not Height, but Time lock time was supposed to be present
+                            if !height_flag {
+                                // TODO: What to do? panic?
+                                panic!("Time locktime needs to be supported by all inputs");
+                            }
+                            // Transaction can no longer contain time locktime
+                            time_flag = false;
+                            time_locktime = None;
+
+                            max_locktime(&mut height_locktime, lock);
+                        },
+                        (Some(time_lock), Some(height_lock)) => {
+                            if time_flag {
+                                max_locktime(&mut time_locktime, time_lock);
+                            }
+
+                            if height_flag {
+                                max_locktime(&mut height_locktime, height_lock);
+                            }
+                        },
+                        _ => {}
+                    }
+
+                    tx.input.push(TxIn {
+                        previous_output: OutPoint {
+                            txid: psbtin.previous_tx_id.unwrap(),
+                            vout: psbtin.output_index.unwrap()
+                        },
+                        script_sig: psbtin.final_script_sig.unwrap_or_default(),
+                        sequence: psbtin.sequence.unwrap_or_default(),
+                        witness: psbtin.final_script_witness.unwrap_or_default()
+                    });
+                }
+
+                match (time_locktime, height_locktime) {
+                    (Some(locktime), None) => { tx.lock_time = locktime; },
+                    (None, Some(locktime)) => { tx.lock_time = locktime; },
+                    // If both the lock times are present, height_lock_time must be chosen
+                    (Some(_), Some(locktime)) => { tx.lock_time = locktime; },
+                    _ => {}
+                }
+
+                for psbtout in psbt_inner.outputs.into_iter() {
+                    tx.output.push(TxOut {
+                        value: psbtout.amount.unwrap(),
+                        script_pubkey: psbtout.script.unwrap()
+                    });
+                }
+
+                tx
+            }
         }
-
-        tx
     }
 
     /// Combines this [`Psbt`] with `other` PSBT as described by BIP 174.
     ///
     /// In accordance with BIP 174 this function is commutative i.e., `A.combine(B) == B.combine(A)`
     pub fn combine(&mut self, other: Self) -> Result<(), Error> {
-        if self.unsigned_tx != other.unsigned_tx {
-            return Err(Error::UnexpectedUnsignedTx {
-                expected: Box::new(self.unsigned_tx.clone()),
-                actual: Box::new(other.unsigned_tx),
-            });
-        }
-
-        // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
-        //          the specification. It can pick arbitrarily when conflicts occur.
-
-        // Keeping the highest version
-        self.version = cmp::max(self.version, other.version);
-
-        // Merging xpubs
-        for (xpub, (fingerprint1, derivation1)) in other.xpub {
-            match self.xpub.entry(xpub) {
-                btree_map::Entry::Vacant(entry) => {
-                    entry.insert((fingerprint1, derivation1));
+        let self_inner = &mut self.inner;
+        let other_inner = other.inner;
+        match (self_inner.version, other_inner.version) {
+            (Version::PsbtV0, Version::PsbtV0) => {
+                let other_unsigned_tx = other_inner.unsigned_tx.unwrap();
+                if self_inner.unsigned_tx.unwrap() != other_unsigned_tx {
+                    return Err(Error::UnexpectedUnsignedTx {
+                        expected: Box::new(self_inner.unsigned_tx.unwrap().clone()),
+                        actual: Box::new(other_unsigned_tx),
+                    });
                 }
-                btree_map::Entry::Occupied(mut entry) => {
-                    // Here in case of the conflict we select the version with algorithm:
-                    // 1) if everything is equal we do nothing
-                    // 2) report an error if
-                    //    - derivation paths are equal and fingerprints are not
-                    //    - derivation paths are of the same length, but not equal
-                    //    - derivation paths has different length, but the shorter one
-                    //      is not the strict suffix of the longer one
-                    // 3) choose longest derivation otherwise
-
-                    let (fingerprint2, derivation2) = entry.get().clone();
-
-                    if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
-                        || (derivation1.len() < derivation2.len()
-                            && derivation1[..]
-                                == derivation2[derivation2.len() - derivation1.len()..])
-                    {
-                        continue;
-                    } else if derivation2[..]
-                        == derivation1[derivation1.len() - derivation2.len()..]
-                    {
-                        entry.insert((fingerprint1, derivation1));
-                        continue;
+        
+                // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
+                //          the specification. It can pick arbitrarily when conflicts occur.
+        
+                // Merging xpubs
+                for (xpub, (fingerprint1, derivation1)) in other_inner.xpub {
+                    match self_inner.xpub.entry(xpub) {
+                        btree_map::Entry::Vacant(entry) => {
+                            entry.insert((fingerprint1, derivation1));
+                        }
+                        btree_map::Entry::Occupied(mut entry) => {
+                            // Here in case of the conflict we select the version with algorithm:
+                            // 1) if everything is equal we do nothing
+                            // 2) report an error if
+                            //    - derivation paths are equal and fingerprints are not
+                            //    - derivation paths are of the same length, but not equal
+                            //    - derivation paths has different length, but the shorter one
+                            //      is not the strict suffix of the longer one
+                            // 3) choose longest derivation otherwise
+        
+                            let (fingerprint2, derivation2) = entry.get().clone();
+        
+                            if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
+                                || (derivation1.len() < derivation2.len()
+                                    && derivation1[..]
+                                        == derivation2[derivation2.len() - derivation1.len()..])
+                            {
+                                continue;
+                            } else if derivation2[..]
+                                == derivation1[derivation1.len() - derivation2.len()..]
+                            {
+                                entry.insert((fingerprint1, derivation1));
+                                continue;
+                            }
+                            return Err(Error::CombineInconsistentKeySources(Box::new(xpub)));
+                        }
                     }
-                    return Err(Error::CombineInconsistentKeySources(Box::new(xpub)));
                 }
+        
+                self_inner.proprietary.extend(other_inner.proprietary);
+                self_inner.unknown.extend(other_inner.unknown);
+        
+                for (self_input, other_input) in self_inner.inputs.iter_mut().zip(other_inner.inputs.into_iter()) {
+                    self_input.combine(other_input);
+                }
+        
+                for (self_output, other_output) in self_inner.outputs.iter_mut().zip(other_inner.outputs.into_iter()) {
+                    self_output.combine(other_output);
+                }
+        
+                Ok(())
+            },
+            (Version::PsbtV2, Version::PsbtV2) => {
+                // TODO
+                Ok(())
+            },
+            (Version::PsbtV0, Version::PsbtV2) => {
+                // TODO
+                Ok(())
+            },
+            (Version::PsbtV2, Version::PsbtV0) => {
+                // TODO
+                Ok(())
             }
         }
-
-        self.proprietary.extend(other.proprietary);
-        self.unknown.extend(other.unknown);
-
-        for (self_input, other_input) in self.inputs.iter_mut().zip(other.inputs.into_iter()) {
-            self_input.combine(other_input);
-        }
-
-        for (self_output, other_output) in self.outputs.iter_mut().zip(other.outputs.into_iter()) {
-            self_output.combine(other_output);
-        }
-
-        Ok(())
     }
 
     /// Attempts to create _all_ the required signatures for this PSBT using `k`.
@@ -356,28 +505,37 @@ impl Psbt {
         C: Signing,
         K: GetKey,
     {
-        let tx = self.unsigned_tx.clone(); // clone because we need to mutably borrow when signing.
-        let mut cache = SighashCache::new(&tx);
+        let inner = &mut self.inner;
+        match inner.version {
+            Version::PsbtV0 => {
+                let tx = inner.unsigned_tx.unwrap().clone(); // clone because we need to mutably borrow when signing.
+                let mut cache = SighashCache::new(&tx);
 
-        let mut used = BTreeMap::new();
-        let mut errors = BTreeMap::new();
+                let mut used = BTreeMap::new();
+                let mut errors = BTreeMap::new();
 
-        for i in 0..self.inputs.len() {
-            if let Ok(SigningAlgorithm::Ecdsa) = self.signing_algorithm(i) {
-                match self.bip32_sign_ecdsa(k, i, &mut cache, secp) {
-                    Ok(v) => {
-                        used.insert(i, v);
-                    }
-                    Err(e) => {
-                        errors.insert(i, e);
-                    }
+                for i in 0..inner.inputs.len() {
+                    if let Ok(SigningAlgorithm::Ecdsa) = self.signing_algorithm(i) {
+                        match self.bip32_sign_ecdsa(k, i, &mut cache, secp) {
+                            Ok(v) => {
+                                used.insert(i, v);
+                            }
+                            Err(e) => {
+                                errors.insert(i, e);
+                            }
+                        }
+                    };
                 }
-            };
-        }
-        if errors.is_empty() {
-            Ok(used)
-        } else {
-            Err((used, errors))
+                if errors.is_empty() {
+                    Ok(used)
+                } else {
+                    Err((used, errors))
+                }
+            },
+            Version::PsbtV2 => {
+                // TODO
+                Ok(BTreeMap::new())
+            }
         }
     }
 
@@ -400,37 +558,46 @@ impl Psbt {
         T: Borrow<Transaction>,
         K: GetKey,
     {
-        let msg_sighash_ty_res = self.sighash_ecdsa(input_index, cache);
+        let inner = &mut self.inner;
+        match inner.version {
+            Version::PsbtV0 => {
+                let msg_sighash_ty_res = self.sighash_ecdsa(input_index, cache);
 
-        let input = &mut self.inputs[input_index]; // Index checked in call to `sighash_ecdsa`.
+                let input = &mut inner.inputs[input_index]; // Index checked in call to `sighash_ecdsa`.
 
-        let mut used = vec![]; // List of pubkeys used to sign the input.
+                let mut used = vec![]; // List of pubkeys used to sign the input.
 
-        for (pk, key_source) in input.bip32_derivation.iter() {
-            let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone()), secp) {
-                sk
-            } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk)), secp) {
-                sk
-            } else {
-                continue;
-            };
+                for (pk, key_source) in input.bip32_derivation.iter() {
+                    let sk = if let Ok(Some(sk)) = k.get_key(KeyRequest::Bip32(key_source.clone()), secp) {
+                        sk
+                    } else if let Ok(Some(sk)) = k.get_key(KeyRequest::Pubkey(PublicKey::new(*pk)), secp) {
+                        sk
+                    } else {
+                        continue;
+                    };
 
-            // Only return the error if we have a secret key to sign this input.
-            let (msg, sighash_ty) = match msg_sighash_ty_res {
-                Err(e) => return Err(e),
-                Ok((msg, sighash_ty)) => (msg, sighash_ty),
-            };
+                    // Only return the error if we have a secret key to sign this input.
+                    let (msg, sighash_ty) = match msg_sighash_ty_res {
+                        Err(e) => return Err(e),
+                        Ok((msg, sighash_ty)) => (msg, sighash_ty),
+                    };
 
-            let sig =
-                ecdsa::Signature { sig: secp.sign_ecdsa(&msg, &sk.inner), hash_ty: sighash_ty };
+                    let sig =
+                        ecdsa::Signature { sig: secp.sign_ecdsa(&msg, &sk.inner), hash_ty: sighash_ty };
 
-            let pk = sk.public_key(secp);
+                    let pk = sk.public_key(secp);
 
-            input.partial_sigs.insert(pk, sig);
-            used.push(pk);
+                    input.partial_sigs.insert(pk, sig);
+                    used.push(pk);
+                }
+
+                Ok(used)
+            },
+            Version::PsbtV2 => {
+                // TODO
+                Ok(vec![])
+            }
         }
-
-        Ok(used)
     }
 
     /// Returns the sighash message to sign an ECDSA input along with the sighash type.
@@ -504,7 +671,11 @@ impl Psbt {
         let utxo = if let Some(witness_utxo) = &input.witness_utxo {
             witness_utxo
         } else if let Some(non_witness_utxo) = &input.non_witness_utxo {
-            let vout = self.unsigned_tx.input[input_index].previous_output.vout;
+            let inner = &self.inner;
+            let vout = match inner.version {
+                Version::PsbtV0 => inner.unsigned_tx.unwrap().input[input_index].previous_output.vout,
+                Version::PsbtV2 => inner.inputs[input_index].output_index.unwrap()
+            };
             &non_witness_utxo.output[vout as usize]
         } else {
             return Err(SignError::MissingSpendUtxo);
@@ -515,18 +686,19 @@ impl Psbt {
     /// Gets the input at `input_index` after checking that it is a valid index.
     fn checked_input(&self, input_index: usize) -> Result<&Input, SignError> {
         self.check_index_is_within_bounds(input_index)?;
-        Ok(&self.inputs[input_index])
+        Ok(&self.inner.inputs[input_index])
     }
 
     /// Checks `input_index` is within bounds for the PSBT `inputs` array and
     /// for the PSBT `unsigned_tx` `input` array.
     fn check_index_is_within_bounds(&self, input_index: usize) -> Result<(), SignError> {
-        if input_index >= self.inputs.len() {
-            return Err(SignError::IndexOutOfBounds(input_index, self.inputs.len()));
+        let inner = &self.inner;
+        if input_index >= inner.inputs.len() {
+            return Err(SignError::IndexOutOfBounds(input_index, inner.inputs.len()));
         }
 
-        if input_index >= self.unsigned_tx.input.len() {
-            return Err(SignError::IndexOutOfBounds(input_index, self.unsigned_tx.input.len()));
+        if inner.version == Version::PsbtV0 && input_index >= inner.unsigned_tx.unwrap().input.len(){
+            return Err(SignError::IndexOutOfBounds(input_index, inner.unsigned_tx.unwrap().input.len()));
         }
 
         Ok(())
@@ -592,8 +764,18 @@ impl Psbt {
             inputs = inputs.checked_add(utxo?.value.to_sat()).ok_or(Error::FeeOverflow)?;
         }
         let mut outputs: u64 = 0;
-        for out in &self.unsigned_tx.output {
-            outputs = outputs.checked_add(out.value.to_sat()).ok_or(Error::FeeOverflow)?;
+        let inner = &self.inner;
+        match inner.version {
+            Version::PsbtV0 => {
+                for out in &inner.unsigned_tx.unwrap().output {
+                    outputs = outputs.checked_add(out.value.to_sat()).ok_or(Error::FeeOverflow)?;
+                }
+            },
+            Version::PsbtV2 => {
+                for out in &inner.outputs {
+                    outputs = outputs.checked_add(out.amount.unwrap().to_sat()).ok_or(Error::FeeOverflow)?;
+                }
+            }
         }
         inputs.checked_sub(outputs).map(Amount::from_sat).ok_or(Error::NegativeFee)
     }
