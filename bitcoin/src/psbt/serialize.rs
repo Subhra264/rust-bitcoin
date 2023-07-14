@@ -12,19 +12,21 @@ use hashes::{hash160, ripemd160, sha256, sha256d, Hash};
 use secp256k1::{self, XOnlyPublicKey};
 
 use super::map::{Input, Map, Output, PsbtSighashType};
+use crate::absolute::LockTime;
 use crate::bip32::{ChildNumber, Fingerprint, KeySource};
 use crate::blockdata::script::ScriptBuf;
-use crate::blockdata::transaction::{Transaction, TxOut};
+use crate::blockdata::transaction::{Sequence, Transaction, TxOut};
 use crate::blockdata::witness::Witness;
 use crate::consensus::encode::{self, deserialize_partial, serialize, Decodable, Encodable};
 use crate::crypto::key::PublicKey;
 use crate::crypto::{ecdsa, taproot};
+use crate::hash_types::Txid;
 use crate::prelude::*;
 use crate::psbt::{Error, Psbt};
 use crate::taproot::{
     ControlBlock, LeafVersion, TapLeafHash, TapNodeHash, TapTree, TaprootBuilder,
 };
-use crate::{io, VarInt};
+use crate::{io, Amount, VarInt};
 /// A trait for serializing a value as raw data for insertion into PSBT
 /// key-value maps.
 pub(crate) trait Serialize {
@@ -40,7 +42,9 @@ pub(crate) trait Deserialize: Sized {
 
 impl Psbt {
     /// Serialize a value as bytes in hex.
-    pub fn serialize_hex(&self) -> String { self.serialize().to_lower_hex_string() }
+    pub fn serialize_hex(&self) -> String {
+        self.serialize().to_lower_hex_string()
+    }
 
     /// Serialize as raw binary data
     pub fn serialize(&self) -> Vec<u8> {
@@ -53,17 +57,18 @@ impl Psbt {
 
         buf.extend(self.serialize_map());
 
-        for i in &self.inputs {
+        for i in &self.inner.inputs {
             buf.extend(i.serialize_map());
         }
 
-        for i in &self.outputs {
+        for i in &self.inner.outputs {
             buf.extend(i.serialize_map());
         }
 
         buf
     }
 
+    // TODO
     /// Deserialize a value from raw binary data.
     pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
         const MAGIC_BYTES: &[u8] = b"psbt";
@@ -79,10 +84,11 @@ impl Psbt {
         let mut d = bytes.get(5..).ok_or(Error::NoMorePairs)?;
 
         let mut global = Psbt::decode_global(&mut d)?;
-        global.unsigned_tx_checks()?;
+        global.inner.unsigned_tx_checks()?;
+        let unsigned_tx = global.inner.unsigned_tx.as_ref().unwrap();
 
         let inputs: Vec<Input> = {
-            let inputs_len: usize = (global.unsigned_tx.input).len();
+            let inputs_len: usize = (unsigned_tx.input).len();
 
             let mut inputs: Vec<Input> = Vec::with_capacity(inputs_len);
 
@@ -94,7 +100,7 @@ impl Psbt {
         };
 
         let outputs: Vec<Output> = {
-            let outputs_len: usize = (global.unsigned_tx.output).len();
+            let outputs_len: usize = (unsigned_tx.output).len();
 
             let mut outputs: Vec<Output> = Vec::with_capacity(outputs_len);
 
@@ -105,14 +111,19 @@ impl Psbt {
             outputs
         };
 
-        global.inputs = inputs;
-        global.outputs = outputs;
+        global.inner.inputs = inputs;
+        global.inner.outputs = outputs;
         Ok(global)
     }
 }
 impl_psbt_de_serialize!(Transaction);
 impl_psbt_de_serialize!(TxOut);
+impl_psbt_de_serialize!(Sequence);
 impl_psbt_de_serialize!(Witness);
+impl_psbt_de_serialize!(u32);
+impl_psbt_de_serialize!(LockTime);
+impl_psbt_de_serialize!(Amount);
+impl_psbt_hash_de_serialize!(Txid);
 impl_psbt_hash_de_serialize!(ripemd160::Hash);
 impl_psbt_hash_de_serialize!(sha256::Hash);
 impl_psbt_hash_de_serialize!(TapLeafHash);
@@ -124,11 +135,15 @@ impl_psbt_hash_de_serialize!(sha256d::Hash);
 impl_psbt_de_serialize!(Vec<TapLeafHash>);
 
 impl Serialize for ScriptBuf {
-    fn serialize(&self) -> Vec<u8> { self.to_bytes() }
+    fn serialize(&self) -> Vec<u8> {
+        self.to_bytes()
+    }
 }
 
 impl Deserialize for ScriptBuf {
-    fn deserialize(bytes: &[u8]) -> Result<Self, Error> { Ok(Self::from(bytes.to_vec())) }
+    fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self::from(bytes.to_vec()))
+    }
 }
 
 impl Serialize for PublicKey {
@@ -146,7 +161,9 @@ impl Deserialize for PublicKey {
 }
 
 impl Serialize for secp256k1::PublicKey {
-    fn serialize(&self) -> Vec<u8> { self.serialize().to_vec() }
+    fn serialize(&self) -> Vec<u8> {
+        self.serialize().to_vec()
+    }
 }
 
 impl Deserialize for secp256k1::PublicKey {
@@ -156,7 +173,9 @@ impl Deserialize for secp256k1::PublicKey {
 }
 
 impl Serialize for ecdsa::Signature {
-    fn serialize(&self) -> Vec<u8> { self.to_vec() }
+    fn serialize(&self) -> Vec<u8> {
+        self.to_vec()
+    }
 }
 
 impl Deserialize for ecdsa::Signature {
@@ -220,15 +239,21 @@ impl Deserialize for KeySource {
 
 // partial sigs
 impl Serialize for Vec<u8> {
-    fn serialize(&self) -> Vec<u8> { self.clone() }
+    fn serialize(&self) -> Vec<u8> {
+        self.clone()
+    }
 }
 
 impl Deserialize for Vec<u8> {
-    fn deserialize(bytes: &[u8]) -> Result<Self, Error> { Ok(bytes.to_vec()) }
+    fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(bytes.to_vec())
+    }
 }
 
 impl Serialize for PsbtSighashType {
-    fn serialize(&self) -> Vec<u8> { serialize(&self.to_u32()) }
+    fn serialize(&self) -> Vec<u8> {
+        serialize(&self.to_u32())
+    }
 }
 
 impl Deserialize for PsbtSighashType {
@@ -240,7 +265,9 @@ impl Deserialize for PsbtSighashType {
 
 // Taproot related ser/deser
 impl Serialize for XOnlyPublicKey {
-    fn serialize(&self) -> Vec<u8> { XOnlyPublicKey::serialize(self).to_vec() }
+    fn serialize(&self) -> Vec<u8> {
+        XOnlyPublicKey::serialize(self).to_vec()
+    }
 }
 
 impl Deserialize for XOnlyPublicKey {
@@ -250,7 +277,9 @@ impl Deserialize for XOnlyPublicKey {
 }
 
 impl Serialize for taproot::Signature {
-    fn serialize(&self) -> Vec<u8> { self.to_vec() }
+    fn serialize(&self) -> Vec<u8> {
+        self.to_vec()
+    }
 }
 
 impl Deserialize for taproot::Signature {
@@ -287,7 +316,9 @@ impl Deserialize for (XOnlyPublicKey, TapLeafHash) {
 }
 
 impl Serialize for ControlBlock {
-    fn serialize(&self) -> Vec<u8> { ControlBlock::serialize(self) }
+    fn serialize(&self) -> Vec<u8> {
+        ControlBlock::serialize(self)
+    }
 }
 
 impl Deserialize for ControlBlock {
@@ -382,7 +413,9 @@ impl Deserialize for TapTree {
 }
 
 // Helper function to compute key source len
-fn key_source_len(key_source: &KeySource) -> usize { 4 + 4 * (key_source.1).as_ref().len() }
+fn key_source_len(key_source: &KeySource) -> usize {
+    4 + 4 * (key_source.1).as_ref().len()
+}
 
 #[cfg(test)]
 mod tests {
