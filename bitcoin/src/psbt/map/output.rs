@@ -10,7 +10,7 @@ use crate::bip32::KeySource;
 use crate::blockdata::script::ScriptBuf;
 use crate::prelude::*;
 use crate::psbt::map::Map;
-use crate::psbt::{raw, Error};
+use crate::psbt::{raw, Error, Version};
 use crate::taproot::{TapLeafHash, TapTree};
 
 /// Type: Redeem ScriptBuf PSBT_OUT_REDEEM_SCRIPT = 0x00
@@ -87,6 +87,16 @@ impl Output {
                     self.bip32_derivation <= <raw_key: secp256k1::PublicKey>|<raw_value: KeySource>
                 }
             }
+            PSBT_OUT_AMOUNT => {
+                impl_psbt_insert_pair! {
+                    self.amount <= <raw_key: _>|<raw_value: Amount>
+                }
+            }
+            PSBT_OUT_SCRIPT => {
+                impl_psbt_insert_pair! {
+                    self.script <= <raw_key: _>|<raw_value: ScriptBuf>
+                }
+            }
             PSBT_OUT_PROPRIETARY => {
                 let key = raw::ProprietaryKey::try_from(raw_key.clone())?;
                 match self.proprietary.entry(key) {
@@ -133,6 +143,32 @@ impl Output {
         combine!(witness_script, self, other);
         combine!(tap_internal_key, self, other);
         combine!(tap_tree, self, other);
+    }
+
+    /// Validates this [`Output`] according to the given [Version]
+    pub fn validate_version(&self, version: Version) -> Result<(), Error> {
+        match version {
+            Version::PsbtV0 => {
+                if let Some(_) = self.amount.as_ref() {
+                    return Err(Error::InvalidOutput);
+                }
+
+                if let Some(_) = self.script.as_ref() {
+                    return Err(Error::InvalidOutput);
+                }
+            }
+            Version::PsbtV2 => {
+                if self.amount.as_ref() == None {
+                    return Err(Error::InvalidOutput);
+                }
+
+                if self.script.as_ref() == None {
+                    return Err(Error::InvalidOutput);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

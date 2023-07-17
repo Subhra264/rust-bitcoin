@@ -68,7 +68,6 @@ impl Psbt {
         buf
     }
 
-    // TODO
     /// Deserialize a value from raw binary data.
     pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
         const MAGIC_BYTES: &[u8] = b"psbt";
@@ -76,43 +75,31 @@ impl Psbt {
             return Err(Error::InvalidMagic);
         }
 
-        const PSBT_SERPARATOR: u8 = 0xff_u8;
-        if bytes.get(MAGIC_BYTES.len()) != Some(&PSBT_SERPARATOR) {
+        const PSBT_SEPARATOR: u8 = 0xff_u8;
+        if bytes.get(MAGIC_BYTES.len()) != Some(&PSBT_SEPARATOR) {
             return Err(Error::InvalidSeparator);
         }
 
         let mut d = bytes.get(5..).ok_or(Error::NoMorePairs)?;
 
         let mut global = Psbt::decode_global(&mut d)?;
-        global.inner.unsigned_tx_checks()?;
-        let unsigned_tx = global.inner.unsigned_tx.as_ref().unwrap();
+        let inputs = &mut global.inner.inputs;
+        let outputs = &mut global.inner.outputs;
 
-        let inputs: Vec<Input> = {
-            let inputs_len: usize = (unsigned_tx.input).len();
+        let inputs_len: usize = inputs.capacity();
+        for _ in 0..inputs_len {
+            let input = Input::decode(&mut d)?;
+            input.validate_version(global.inner.version)?;
+            inputs.push(input);
+        }
 
-            let mut inputs: Vec<Input> = Vec::with_capacity(inputs_len);
+        let outputs_len: usize = outputs.capacity();
+        for _ in 0..outputs_len {
+            let output = Output::decode(&mut d)?;
+            output.validate_version(global.inner.version)?;
+            outputs.push(output);
+        }
 
-            for _ in 0..inputs_len {
-                inputs.push(Input::decode(&mut d)?);
-            }
-
-            inputs
-        };
-
-        let outputs: Vec<Output> = {
-            let outputs_len: usize = (unsigned_tx.output).len();
-
-            let mut outputs: Vec<Output> = Vec::with_capacity(outputs_len);
-
-            for _ in 0..outputs_len {
-                outputs.push(Output::decode(&mut d)?);
-            }
-
-            outputs
-        };
-
-        global.inner.inputs = inputs;
-        global.inner.outputs = outputs;
         Ok(global)
     }
 }

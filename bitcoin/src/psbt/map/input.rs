@@ -18,7 +18,7 @@ use crate::crypto::{ecdsa, taproot};
 use crate::{prelude::*, absolute};
 use crate::psbt::map::Map;
 use crate::psbt::serialize::Deserialize;
-use crate::psbt::{self, error, raw, Error};
+use crate::psbt::{self, error, raw, Error, Version};
 use crate::sighash::{
     EcdsaSighashType, InvalidSighashTypeError, NonStandardSighashTypeError, SighashTypeParseError,
     TapSighashType,
@@ -353,6 +353,31 @@ impl Input {
                     error::PsbtHash::Hash256,
                 )?;
             }
+            PSBT_IN_PREVIOUS_TXID => {
+                impl_psbt_insert_pair! {
+                    self.previous_tx_id <= <raw_key: _>|<raw_value: Txid>
+                }
+            }
+            PSBT_IN_OUTPUT_INDEX => {
+                impl_psbt_insert_pair! {
+                    self.output_index <= <raw_key: _>|<raw_value: u32>
+                }
+            }
+            PSBT_IN_SEQUENCE => {
+                impl_psbt_insert_pair! {
+                    self.sequence <= <raw_key: _>|<raw_value: Sequence>
+                }
+            }
+            PSBT_IN_REQUIRED_TIME_LOCKTIME => {
+                impl_psbt_insert_pair! {
+                    self.time_lock_time <= <raw_key: _>|<raw_value: absolute::LockTime>
+                }
+            }
+            PSBT_IN_REQUIRED_HEIGHT_LOCKTIME => {
+                impl_psbt_insert_pair! {
+                    self.height_lock_time <= <raw_key: _>|<raw_value: absolute::LockTime>
+                }
+            }
             PSBT_IN_TAP_KEY_SIG => {
                 impl_psbt_insert_pair! {
                     self.tap_key_sig <= <raw_key: _>|<raw_value: taproot::Signature>
@@ -431,6 +456,45 @@ impl Input {
         combine!(tap_key_sig, self, other);
         combine!(tap_internal_key, self, other);
         combine!(tap_merkle_root, self, other);
+    }
+
+    /// Validates this [`Input`] according to the given Psbt [`Version`]
+    pub fn validate_version(&self, version: Version) -> Result<(), Error> {
+        match version {
+            Version::PsbtV0 => {
+                if let Some(_) = self.previous_tx_id.as_ref() {
+                    return Err(Error::InvalidInput);
+                }
+
+                if let Some(_) = self.output_index.as_ref() {
+                    return Err(Error::InvalidInput);
+                }
+
+                if let Some(_) = self.sequence.as_ref() {
+                    return Err(Error::InvalidInput);
+                }
+
+                if let Some(_) = self.time_lock_time.as_ref() {
+                    return Err(Error::InvalidInput);
+                }
+
+                if let Some(_) = self.height_lock_time.as_ref() {
+                    return Err(Error::InvalidInput);
+                }
+
+            }
+            Version::PsbtV2 => {
+                if self.previous_tx_id.as_ref() == None {
+                    return Err(Error::InvalidInput);
+                }
+                
+                if self.output_index.as_ref() == None {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -91,6 +91,18 @@ impl TxModifiable {
         byte |= (self.has_sighash_single as u8) << 2;
         byte
     }
+
+    // For now, there seems to be no reason to return an Error here.
+    // But since the structure is not complete yet and more flags
+    // can be introduced in future (which may or may not come with
+    // various rules for coexistence), a Result is returned here.
+    fn from_raw(tx_modifiable: u8) -> Result<Self, Error> {
+        Ok(TxModifiable {
+            input_modifiable: tx_modifiable & 0x01 != 0,
+            output_modifiable: tx_modifiable & 0x02 != 0,
+            has_sighash_single: tx_modifiable & 0x04 != 0
+        })
+    }
 }
 
 /// A Partially Signed Transaction.
@@ -135,9 +147,7 @@ impl PsbtInner {
             Version::PsbtV0 => {
                 // Validate the inner as PsbtV0
                 // unsigned_tx --> required
-                if self.unsigned_tx == None {
-                    return Err(Error::MustHaveUnsignedTx);
-                }
+                self.unsigned_tx_checks()?;
 
                 // tx_version --> None
                 if let Some(_) = self.tx_version {
@@ -162,8 +172,15 @@ impl PsbtInner {
                 }
 
                 // tx_version: --> required
-                if self.tx_version == None {
-                    return Err(Error::MissingTxVersion);
+                match self.tx_version {
+                    None => return Err(Error::InvalidTxVersion),
+                    Some(tx_version) => {
+                        // According to BIP 370, tx_version must be atleast 2
+                        if tx_version < 2 {
+                            return Err(Error::InvalidTxVersion);
+                        }
+                        return Ok(());
+                    }
                 }
 
                 // fallback_locktime --> Not required but can be present
@@ -182,12 +199,12 @@ impl PsbtInner {
                     if !txin.script_sig.is_empty() {
                         return Err(Error::UnsignedTxHasScriptSigs);
                     }
-        
+
                     if !txin.witness.is_empty() {
                         return Err(Error::UnsignedTxHasScriptWitnesses);
                     }
                 }
-        
+
                 Ok(())
             },
             None => Err(Error::MustHaveUnsignedTx)

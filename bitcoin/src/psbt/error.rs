@@ -112,14 +112,18 @@ pub enum Error {
     FallbackLocktimePresent,
     /// Transaction Modifiable flags are not allowed in PsbtV0
     TxModifiablePresent,
-
+    /// Invalid Input
+    InvalidInput,
+    /// Invalid Output
+    InvalidOutput,
     // PsbtV2 field Errors
-    /// Transaction Version not present in PsbtV2
-    MissingTxVersion,
+    /// Transaction Version not present in PsbtV2 or invallid if present
+    InvalidTxVersion,
     /// Unsigned Transaction is not allowed in PsbtV2
     UnsignedTxPresent,
-    /// Output Index not present in Input
-    OutputIndexNotPresent,
+    /// In a serialized psbt, input and output counts are required
+    /// to be present in the global types section
+    InputOutputCountsNotPresent,
 }
 
 impl fmt::Display for Error {
@@ -180,9 +184,12 @@ impl fmt::Display for Error {
             Error::TxVersionPresent => f.write_str("transaction version not allowed in PsbtV0"),
             Error::FallbackLocktimePresent => f.write_str("fallback locktime not allowed in PsbtV0"),
             Error::TxModifiablePresent => f.write_str("TxModifiable not allowed in PsbtV0"),
-            Error::MissingTxVersion => f.write_str("transaction version is required in PsbtV2"),
+            Error::InvalidTxVersion => f.write_str("transaction version is required in PsbtV2"),
             Error::UnsignedTxPresent => f.write_str("unsigned transaction not allowed in PsbtV2"),
-            Error::OutputIndexNotPresent => f.write_str("output index not present in the PsbtV2 input"),
+            Error::InputOutputCountsNotPresent =>
+                f.write_str("input and output counts are required in psbtv2"),
+            Error::InvalidInput => f.write_str("input not valid"),
+            Error::InvalidOutput => f.write_str("output not valid"),
         }
     }
 }
@@ -229,9 +236,11 @@ impl std::error::Error for Error {
             | TxVersionPresent
             | FallbackLocktimePresent
             | TxModifiablePresent
-            | MissingTxVersion
+            | InvalidTxVersion
             | UnsignedTxPresent
-            | OutputIndexNotPresent => None,
+            | InputOutputCountsNotPresent
+            | InvalidInput
+            | InvalidOutput => None,
         }
     }
 }
