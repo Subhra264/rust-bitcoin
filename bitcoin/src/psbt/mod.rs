@@ -73,12 +73,19 @@ impl Version {
     }
 }
 
+/// Transaction Modification flags used in PsbtV2 as described in BIP-370
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct TxModifiable {
+    /// Indicates whether inputs can be added or removed
     pub input_modifiable: bool,
+    /// Indicates whether outputs can be added or removed
     pub output_modifiable: bool,
+    /// Indicates whether the transaction has a SIGHASH_SINGLE signature
+    /// who's input and output pairing must be preserved. It essentially indicates
+    /// that the Constructor must iterate the inputs to determine whether
+    /// and how to add or remove an input
     pub has_sighash_single: bool,
     // More flags
 }
@@ -272,7 +279,7 @@ impl Psbt {
     /// ## Panics
     ///
     /// The function panics if the length of transaction inputs is not equal to the length of PSBT inputs.
-    pub fn iter_funding_utxos(&self) -> Box<dyn Iterator<Item = Result<&TxOut, Error>>> {
+    pub fn iter_funding_utxos(&self) -> Box<dyn Iterator<Item = Result<&TxOut, Error>> + '_> {
         let inner = &self.inner;
         match inner.version {
             Version::PsbtV0 => {
@@ -424,16 +431,17 @@ impl Psbt {
         match (self_inner.version, other_inner.version) {
             (Version::PsbtV0, Version::PsbtV0) => {
                 let other_unsigned_tx = other_inner.unsigned_tx.unwrap();
-                if self_inner.unsigned_tx.unwrap() != other_unsigned_tx {
+                let self_unsigned_tx = self_inner.unsigned_tx.as_ref().unwrap();
+                if self_unsigned_tx != &other_unsigned_tx {
                     return Err(Error::UnexpectedUnsignedTx {
-                        expected: Box::new(self_inner.unsigned_tx.unwrap().clone()),
+                        expected: Box::new(self_unsigned_tx.clone()),
                         actual: Box::new(other_unsigned_tx),
                     });
                 }
-        
+
                 // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
                 //          the specification. It can pick arbitrarily when conflicts occur.
-        
+
                 // Merging xpubs
                 for (xpub, (fingerprint1, derivation1)) in other_inner.xpub {
                     match self_inner.xpub.entry(xpub) {
@@ -449,9 +457,9 @@ impl Psbt {
                             //    - derivation paths has different length, but the shorter one
                             //      is not the strict suffix of the longer one
                             // 3) choose longest derivation otherwise
-        
+
                             let (fingerprint2, derivation2) = entry.get().clone();
-        
+
                             if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
                                 || (derivation1.len() < derivation2.len()
                                     && derivation1[..]
@@ -468,18 +476,18 @@ impl Psbt {
                         }
                     }
                 }
-        
+
                 self_inner.proprietary.extend(other_inner.proprietary);
                 self_inner.unknown.extend(other_inner.unknown);
-        
+
                 for (self_input, other_input) in self_inner.inputs.iter_mut().zip(other_inner.inputs.into_iter()) {
                     self_input.combine(other_input);
                 }
-        
+
                 for (self_output, other_output) in self_inner.outputs.iter_mut().zip(other_inner.outputs.into_iter()) {
                     self_output.combine(other_output);
                 }
-        
+
                 Ok(())
             },
             (Version::PsbtV2, Version::PsbtV2) => {
@@ -525,7 +533,7 @@ impl Psbt {
         let inner = &mut self.inner;
         match inner.version {
             Version::PsbtV0 => {
-                let tx = inner.unsigned_tx.unwrap().clone(); // clone because we need to mutably borrow when signing.
+                let tx = inner.unsigned_tx.as_ref().unwrap().clone(); // clone because we need to mutably borrow when signing.
                 let mut cache = SighashCache::new(&tx);
 
                 let mut used = BTreeMap::new();
@@ -575,12 +583,11 @@ impl Psbt {
         T: Borrow<Transaction>,
         K: GetKey,
     {
-        let inner = &mut self.inner;
-        match inner.version {
+        match self.inner.version {
             Version::PsbtV0 => {
                 let msg_sighash_ty_res = self.sighash_ecdsa(input_index, cache);
 
-                let input = &mut inner.inputs[input_index]; // Index checked in call to `sighash_ecdsa`.
+                let input = &mut self.inner.inputs[input_index]; // Index checked in call to `sighash_ecdsa`.
 
                 let mut used = vec![]; // List of pubkeys used to sign the input.
 
@@ -690,7 +697,7 @@ impl Psbt {
         } else if let Some(non_witness_utxo) = &input.non_witness_utxo {
             let inner = &self.inner;
             let vout = match inner.version {
-                Version::PsbtV0 => inner.unsigned_tx.unwrap().input[input_index].previous_output.vout,
+                Version::PsbtV0 => inner.unsigned_tx.as_ref().unwrap().input[input_index].previous_output.vout,
                 Version::PsbtV2 => inner.inputs[input_index].output_index.unwrap()
             };
             &non_witness_utxo.output[vout as usize]
@@ -714,8 +721,8 @@ impl Psbt {
             return Err(SignError::IndexOutOfBounds(input_index, inner.inputs.len()));
         }
 
-        if inner.version == Version::PsbtV0 && input_index >= inner.unsigned_tx.unwrap().input.len(){
-            return Err(SignError::IndexOutOfBounds(input_index, inner.unsigned_tx.unwrap().input.len()));
+        if inner.version == Version::PsbtV0 && input_index >= inner.unsigned_tx.as_ref().unwrap().input.len() {
+            return Err(SignError::IndexOutOfBounds(input_index, inner.unsigned_tx.as_ref().unwrap().input.len()));
         }
 
         Ok(())
@@ -784,7 +791,7 @@ impl Psbt {
         let inner = &self.inner;
         match inner.version {
             Version::PsbtV0 => {
-                for out in &inner.unsigned_tx.unwrap().output {
+                for out in &inner.unsigned_tx.as_ref().unwrap().output {
                     outputs = outputs.checked_add(out.value.to_sat()).ok_or(Error::FeeOverflow)?;
                 }
             },
