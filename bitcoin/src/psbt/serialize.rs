@@ -22,7 +22,7 @@ use crate::crypto::key::PublicKey;
 use crate::crypto::{ecdsa, taproot};
 use crate::hash_types::Txid;
 use crate::prelude::*;
-use crate::psbt::{Error, Psbt};
+use crate::psbt::{Error, Psbt, Version};
 use crate::taproot::{
     ControlBlock, LeafVersion, TapLeafHash, TapNodeHash, TapTree, TaprootBuilder,
 };
@@ -86,14 +86,28 @@ impl Psbt {
         let inputs = &mut global.inner.inputs;
         let outputs = &mut global.inner.outputs;
 
-        let inputs_len: usize = inputs.capacity();
+        let inputs_len: usize = {
+            match global.inner.version {
+                Version::PsbtV0 => {
+                    global.inner.unsigned_tx.as_ref().unwrap().input.len()
+                }
+                _ => inputs.capacity()
+            }
+        };
         for _ in 0..inputs_len {
             let input = Input::decode(&mut d)?;
             input.validate_version(global.inner.version)?;
             inputs.push(input);
         }
 
-        let outputs_len: usize = outputs.capacity();
+        let outputs_len: usize = {
+            match global.inner.version {
+                Version::PsbtV0 => {
+                    global.inner.unsigned_tx.as_ref().unwrap().output.len()
+                }
+                _ => outputs.capacity()
+            }
+        };
         for _ in 0..outputs_len {
             let output = Output::decode(&mut d)?;
             output.validate_version(global.inner.version)?;

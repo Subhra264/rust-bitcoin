@@ -116,14 +116,16 @@ pub enum Error {
     InvalidInput,
     /// Invalid Output
     InvalidOutput,
+
     // PsbtV2 field Errors
     /// Transaction Version not present in PsbtV2 or invallid if present
     InvalidTxVersion,
     /// Unsigned Transaction is not allowed in PsbtV2
     UnsignedTxPresent,
-    /// In a serialized psbt, input and output counts are required
-    /// to be present in the global types section
-    InputOutputCountsNotPresent,
+    /// In a serialized psbtv2, input and output counts are required
+    /// to be present in the global types section. On the other hand,
+    /// they must be omitted in PsbtV0.
+    InvalidInputOutputCounts,
 }
 
 impl fmt::Display for Error {
@@ -186,8 +188,8 @@ impl fmt::Display for Error {
             Error::TxModifiablePresent => f.write_str("TxModifiable not allowed in PsbtV0"),
             Error::InvalidTxVersion => f.write_str("transaction version is required in PsbtV2"),
             Error::UnsignedTxPresent => f.write_str("unsigned transaction not allowed in PsbtV2"),
-            Error::InputOutputCountsNotPresent =>
-                f.write_str("input and output counts are required in psbtv2"),
+            Error::InvalidInputOutputCounts =>
+                f.write_str("input and output counts are not valid"),
             Error::InvalidInput => f.write_str("input not valid"),
             Error::InvalidOutput => f.write_str("output not valid"),
         }
@@ -238,7 +240,7 @@ impl std::error::Error for Error {
             | TxModifiablePresent
             | InvalidTxVersion
             | UnsignedTxPresent
-            | InputOutputCountsNotPresent
+            | InvalidInputOutputCounts
             | InvalidInput
             | InvalidOutput => None,
         }

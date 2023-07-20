@@ -8,7 +8,7 @@ use crate::blockdata::transaction::Transaction;
 use crate::consensus::encode::MAX_VEC_SIZE;
 use crate::consensus::{encode, Decodable};
 use crate::io::{self, Cursor, Read};
-use crate::prelude::*;
+use crate::{prelude::*, VarInt};
 use crate::psbt::map::Map;
 use crate::psbt::{raw, Error, Input, Output, Psbt, PsbtInner, TxModifiable, Version};
 
@@ -125,8 +125,8 @@ impl Psbt {
         let mut version: Option<u32> = None;
         let mut tx_version: Option<i32> = None;
         let mut fallback_locktime: Option<LockTime> = None;
-        let mut input_count: Option<u32> = None;
-        let mut output_count: Option<u32> = None;
+        let mut input_count: Option<VarInt> = None;
+        let mut output_count: Option<VarInt> = None;
         let mut tx_modifiable: Option<TxModifiable> = None;
         let mut unknowns: BTreeMap<raw::Key, Vec<u8>> = Default::default();
         let mut xpub_map: BTreeMap<ExtendedPubKey, (Fingerprint, DerivationPath)> =
@@ -296,7 +296,7 @@ impl Psbt {
                                     version = Some(Decodable::consensus_decode(&mut decoder)?);
                                     // We only understand version 0 and 2 PSBTs. According to BIP-174 we
                                     // should throw an error if we see anything other than version 0 and 2.
-                                    if version != Some(0) || version != Some(2) {
+                                    if version != Some(0) && version != Some(2) {
                                         return Err(Error::Version(
                                             "PSBT versions other than 0 and 2 are not supported",
                                         ));
@@ -345,15 +345,18 @@ impl Psbt {
         if version != Version::PsbtV0 {
             match (input_count, output_count) {
                 (Some(input_count), Some(output_count)) => {
-                    inputs = Vec::with_capacity(input_count as usize);
-                    outputs = Vec::with_capacity(output_count as usize);
+                    inputs = Vec::with_capacity(input_count.0 as usize);
+                    outputs = Vec::with_capacity(output_count.0 as usize);
                 }
-                _ => return Err(Error::InputOutputCountsNotPresent),
+                _ => return Err(Error::InvalidInputOutputCounts),
             }
         } else {
-            let unsigned_tx = tx.as_ref().unwrap();
-            inputs = Vec::with_capacity(unsigned_tx.input.len());
-            outputs = Vec::with_capacity(unsigned_tx.output.len());
+            // A PsbtV0 can not contain input and output counts
+            if input_count.is_some() || output_count.is_some() {
+                return Err(Error::InvalidInputOutputCounts);
+            }
+            inputs = vec![];
+            outputs = vec![];
         }
 
         let psbt_inner = PsbtInner {

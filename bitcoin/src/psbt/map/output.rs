@@ -149,20 +149,20 @@ impl Output {
     pub fn validate_version(&self, version: Version) -> Result<(), Error> {
         match version {
             Version::PsbtV0 => {
-                if let Some(_) = self.amount.as_ref() {
+                if self.amount.is_some() {
                     return Err(Error::InvalidOutput);
                 }
 
-                if let Some(_) = self.script.as_ref() {
+                if self.script.is_some() {
                     return Err(Error::InvalidOutput);
                 }
             }
             Version::PsbtV2 => {
-                if self.amount.as_ref() == None {
+                if self.amount.is_none() {
                     return Err(Error::InvalidOutput);
                 }
 
-                if self.script.as_ref() == None {
+                if self.script.is_none() {
                     return Err(Error::InvalidOutput);
                 }
             }

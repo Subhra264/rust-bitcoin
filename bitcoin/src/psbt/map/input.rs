@@ -462,34 +462,45 @@ impl Input {
     pub fn validate_version(&self, version: Version) -> Result<(), Error> {
         match version {
             Version::PsbtV0 => {
-                if let Some(_) = self.previous_tx_id.as_ref() {
+                if self.previous_tx_id.is_some() {
                     return Err(Error::InvalidInput);
                 }
 
-                if let Some(_) = self.output_index.as_ref() {
+                if self.output_index.is_some() {
                     return Err(Error::InvalidInput);
                 }
 
-                if let Some(_) = self.sequence.as_ref() {
+                if self.sequence.is_some() {
                     return Err(Error::InvalidInput);
                 }
 
-                if let Some(_) = self.time_lock_time.as_ref() {
+                if self.time_lock_time.is_some() {
                     return Err(Error::InvalidInput);
                 }
 
-                if let Some(_) = self.height_lock_time.as_ref() {
+                if self.height_lock_time.is_some() {
                     return Err(Error::InvalidInput);
                 }
-
             }
             Version::PsbtV2 => {
-                if self.previous_tx_id.as_ref() == None {
+                if self.previous_tx_id.as_ref().is_none() {
                     return Err(Error::InvalidInput);
                 }
-                
-                if self.output_index.as_ref() == None {
+
+                if self.output_index.as_ref().is_none() {
                     return Err(Error::InvalidInput);
+                }
+
+                if let Some(locktime) = self.time_lock_time.as_ref() {
+                    if locktime.is_block_height() {
+                        return Err(Error::InvalidInput);
+                    }
+                }
+
+                if let Some(locktime) = self.height_lock_time.as_ref() {
+                    if locktime.is_block_time() {
+                        return Err(Error::InvalidInput);
+                    }
                 }
             }
         }
