@@ -126,6 +126,9 @@ pub enum Error {
     /// to be present in the global types section. On the other hand,
     /// they must be omitted in PsbtV0.
     InvalidInputOutputCounts,
+    /// Computing Locktime error for Non-PsbtV0 indicating the
+    /// required Locktime not present in the input. 
+    RequiredLocktimeNotPresent,
 }
 
 impl fmt::Display for Error {
@@ -192,6 +195,7 @@ impl fmt::Display for Error {
                 f.write_str("input and output counts are not valid"),
             Error::InvalidInput => f.write_str("input not valid"),
             Error::InvalidOutput => f.write_str("output not valid"),
+            Error::RequiredLocktimeNotPresent => f.write_str("required locktime not present in this Psbt input"),
         }
     }
 }
@@ -242,7 +246,8 @@ impl std::error::Error for Error {
             | UnsignedTxPresent
             | InvalidInputOutputCounts
             | InvalidInput
-            | InvalidOutput => None,
+            | InvalidOutput
+            | RequiredLocktimeNotPresent => None,
         }
     }
 }

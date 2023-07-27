@@ -437,6 +437,26 @@ impl Input {
             self.non_witness_utxo = None; // Clear out any non-witness UTXO when we set a witness one
         }
 
+        if let (&None, Some(previous_tx_id)) = (&self.previous_tx_id, other.previous_tx_id) {
+            self.previous_tx_id = Some(previous_tx_id);
+        }
+
+        if let (&None, Some(output_index)) = (&self.output_index, other.output_index) {
+            self.output_index = Some(output_index);
+        }
+
+        if let (&None, Some(sequence)) = (&self.sequence, other.sequence) {
+            self.sequence = Some(sequence);
+        }
+
+        if let (&None, Some(locktime)) = (&self.time_lock_time, other.time_lock_time) {
+            self.time_lock_time = Some(locktime);
+        }
+
+        if let (&None, Some(locktime)) = (&self.height_lock_time, other.height_lock_time) {
+            self.height_lock_time = Some(locktime);
+        }
+
         self.partial_sigs.extend(other.partial_sigs);
         self.bip32_derivation.extend(other.bip32_derivation);
         self.ripemd160_preimages.extend(other.ripemd160_preimages);

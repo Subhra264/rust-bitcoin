@@ -20,7 +20,7 @@ use crate::blockdata::script::ScriptBuf;
 use crate::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut};
 use crate::crypto::ecdsa;
 use crate::crypto::key::{PrivateKey, PublicKey};
-use crate::prelude::*;
+use crate::{prelude::*, Witness, Sequence};
 use crate::sighash::{self, EcdsaSighashType, SighashCache};
 use crate::Amount;
 
@@ -100,16 +100,25 @@ impl TxModifiable {
         byte
     }
 
-    // For now, there seems to be no reason to return an Error here.
-    // But since the structure is not complete yet and more flags
-    // can be introduced in future (which may or may not come with
-    // various rules for coexistence), a Result is returned here.
+    /// For now, there seems to be no reason to return an Error here.
+    /// But since the structure is not complete yet and more flags
+    /// can be introduced in future (which may or may not come with
+    /// various rules for coexistence), a Result is returned here.
     fn from_raw(tx_modifiable: u8) -> Result<Self, Error> {
         Ok(TxModifiable {
             input_modifiable: tx_modifiable & 0x01 != 0,
             output_modifiable: tx_modifiable & 0x02 != 0,
             has_sighash_single: tx_modifiable & 0x04 != 0,
         })
+    }
+
+    /// Combines this TxModifiable flags with other TxModifiable flags.
+    /// No reason to return an [`Error`] here, but done for probable future needs.
+    fn combine(&mut self, tx_modifiable: &TxModifiable) -> Result<(), Error> {
+        self.input_modifiable |= tx_modifiable.input_modifiable;
+        self.output_modifiable |= tx_modifiable.output_modifiable;
+        self.has_sighash_single |= tx_modifiable.has_sighash_single;
+        Ok(())
     }
 }
 
@@ -149,6 +158,26 @@ pub struct PsbtInner {
 }
 
 impl PsbtInner {
+    /// Validates the inputs according to the [`PsbtInner`] version
+    pub fn validate_inputs_version(&self) -> Result<(), Error> {
+        if !self.inputs.is_empty() {
+            for input in &self.inputs {
+                input.validate_version(self.version)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the outputs according to the [`PsbtInner`] version
+    pub fn validate_outputs_version(&self) -> Result<(), Error> {
+        if !self.outputs.is_empty() {
+            for output in &self.outputs {
+                output.validate_version(self.version)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validates the given `PsbtInner` according to its version
     pub fn validate_inner(&self) -> Result<(), Error> {
         match self.version {
@@ -196,6 +225,8 @@ impl PsbtInner {
             }
         }
 
+        self.validate_inputs_version()?;
+        self.validate_outputs_version()?;
         Ok(())
     }
 
@@ -223,7 +254,7 @@ impl PsbtInner {
     ///
     /// # Errors
     ///
-    /// If transactions is not unsigned.
+    /// If transaction is not unsigned.
     pub fn from_unsigned_tx(tx: Transaction) -> Result<Self, Error> {
         let psbt = PsbtInner {
             inputs: vec![Default::default(); tx.input.len()],
@@ -319,212 +350,282 @@ impl Psbt {
         }
     }
 
-    /// Extracts the `Transaction` from a PSBT by filling in the available signature information.
-    pub fn extract_tx(self) -> Transaction {
-        let psbt_inner = self.inner;
+    /// Computes the locktime for a Non-PsbtV0
+    fn compute_locktime(&self) -> Result<absolute::LockTime, Error> {
+        let inner = &self.inner;
+        let mut time_locktime: Option<absolute::LockTime> = None;
+        let mut height_locktime: Option<absolute::LockTime> = None;
+        let (mut time_flag, mut height_flag) = (true, true);
 
-        match psbt_inner.version {
-            Version::PsbtV0 => {
-                let mut tx: Transaction = psbt_inner.unsigned_tx.unwrap();
-
-                for (vin, psbtin) in tx.input.iter_mut().zip(psbt_inner.inputs.into_iter()) {
-                    vin.script_sig = psbtin.final_script_sig.unwrap_or_default();
-                    vin.witness = psbtin.final_script_witness.unwrap_or_default();
+        /// Calculates the max lock time and assigns it to the given locktime variable.
+        fn max_locktime(
+            locktime: &mut Option<absolute::LockTime>,
+            new_lock: absolute::LockTime,
+        ) {
+            match *locktime {
+                None => {
+                    *locktime = Some(new_lock);
                 }
-
-                tx
-            }
-            Version::PsbtV2 => {
-                let mut tx = Transaction {
-                    version: psbt_inner.tx_version.unwrap(),
-                    lock_time: psbt_inner.fallback_locktime.unwrap_or(absolute::LockTime::ZERO),
-                    input: vec![],
-                    output: vec![],
-                };
-                let mut time_locktime: Option<absolute::LockTime> = None;
-                let mut height_locktime: Option<absolute::LockTime> = None;
-                let (mut time_flag, mut height_flag) = (true, true);
-
-                /// Calculates the max lock time and assigns it to the given locktime variable.
-                fn max_locktime(
-                    locktime: &mut Option<absolute::LockTime>,
-                    new_lock: absolute::LockTime,
-                ) {
-                    match *locktime {
-                        None => {
-                            *locktime = Some(new_lock);
-                        }
-                        Some(lock) => {
-                            if lock >= new_lock {
-                                *locktime = Some(lock);
-                            } else {
-                                *locktime = Some(new_lock);
-                            }
-                        }
+                Some(lock) => {
+                    if lock >= new_lock {
+                        *locktime = Some(lock);
+                    } else {
+                        *locktime = Some(new_lock);
                     }
                 }
-
-                for psbtin in psbt_inner.inputs.into_iter() {
-                    // See https://bips.xyz/370#determining-lock-time
-                    match (psbtin.time_lock_time, psbtin.height_lock_time) {
-                        (Some(lock), None) => {
-                            // Not Time, but Height lock time was supposed to be present
-                            if !time_flag {
-                                // TODO: What to do? panic?
-                                panic!("Height locktime needs to be supported by all inputs");
-                            }
-                            // Transaction can no longer contain height locktime
-                            height_flag = false;
-                            height_locktime = None;
-
-                            max_locktime(&mut time_locktime, lock);
-                        }
-                        (None, Some(lock)) => {
-                            // Not Height, but Time lock time was supposed to be present
-                            if !height_flag {
-                                // TODO: What to do? panic?
-                                panic!("Time locktime needs to be supported by all inputs");
-                            }
-                            // Transaction can no longer contain time locktime
-                            time_flag = false;
-                            time_locktime = None;
-
-                            max_locktime(&mut height_locktime, lock);
-                        }
-                        (Some(time_lock), Some(height_lock)) => {
-                            if time_flag {
-                                max_locktime(&mut time_locktime, time_lock);
-                            }
-
-                            if height_flag {
-                                max_locktime(&mut height_locktime, height_lock);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    tx.input.push(TxIn {
-                        previous_output: OutPoint {
-                            txid: psbtin.previous_tx_id.unwrap(),
-                            vout: psbtin.output_index.unwrap(),
-                        },
-                        script_sig: psbtin.final_script_sig.unwrap_or_default(),
-                        sequence: psbtin.sequence.unwrap_or_default(),
-                        witness: psbtin.final_script_witness.unwrap_or_default(),
-                    });
-                }
-
-                match (time_locktime, height_locktime) {
-                    (Some(locktime), None) => {
-                        tx.lock_time = locktime;
-                    }
-                    (None, Some(locktime)) => {
-                        tx.lock_time = locktime;
-                    }
-                    // If both the lock times are present, height_lock_time must be chosen
-                    (Some(_), Some(locktime)) => {
-                        tx.lock_time = locktime;
-                    }
-                    _ => {}
-                }
-
-                for psbtout in psbt_inner.outputs.into_iter() {
-                    tx.output.push(TxOut {
-                        value: psbtout.amount.unwrap(),
-                        script_pubkey: psbtout.script.unwrap(),
-                    });
-                }
-
-                tx
             }
         }
+
+        for psbtin in inner.inputs.iter() {
+            // See https://bips.xyz/370#determining-lock-time
+            match (psbtin.time_lock_time, psbtin.height_lock_time) {
+                (Some(lock), None) => {
+                    // Not Time, but Height lock time was supposed to be present
+                    if !time_flag {
+                        return Err(Error::RequiredLocktimeNotPresent);
+                    }
+                    // Transaction can no longer contain height locktime
+                    height_flag = false;
+                    height_locktime = None;
+
+                    max_locktime(&mut time_locktime, lock);
+                }
+                (None, Some(lock)) => {
+                    // Not Height, but Time lock time was supposed to be present
+                    if !height_flag {
+                        return Err(Error::RequiredLocktimeNotPresent);
+                    }
+                    // Transaction can no longer contain time locktime
+                    time_flag = false;
+                    time_locktime = None;
+
+                    max_locktime(&mut height_locktime, lock);
+                }
+                (Some(time_lock), Some(height_lock)) => {
+                    if time_flag {
+                        max_locktime(&mut time_locktime, time_lock);
+                    }
+
+                    if height_flag {
+                        max_locktime(&mut height_locktime, height_lock);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match (time_locktime, height_locktime) {
+            (Some(locktime), None) => {
+                Ok(locktime)
+            }
+            (None, Some(locktime)) => {
+                Ok(locktime)
+            }
+            // If both the lock times are present, height_lock_time must be chosen
+            (Some(_), Some(locktime)) => {
+                Ok(locktime)
+            }
+            _ => {
+                if let Some(locktime) = inner.fallback_locktime {
+                    return Ok(locktime);
+                }
+                Ok(absolute::LockTime::ZERO)
+            }
+        }
+    }
+
+    /// Constructs a new unsigned transaction from this Psbt.
+    /// Should be used for Non-PsbtV0s only.
+    fn construct_unsigned_tx(&self) -> Result<Transaction, Error> {
+        if self.inner.version == Version::PsbtV0 {
+            return Ok(self.inner.unsigned_tx.as_ref().unwrap().clone());
+        }
+        let mut tx = Transaction {
+            version: self.inner.tx_version.unwrap(),
+            lock_time: self.compute_locktime()?,
+            input: vec![],
+            output: vec![],
+        };
+
+        for psbtin in self.inner.inputs.iter() {
+            tx.input.push(TxIn {
+                previous_output: OutPoint {
+                    txid: psbtin.previous_tx_id.unwrap(),
+                    vout: psbtin.output_index.unwrap(),
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: psbtin.sequence.unwrap_or_default(),
+                witness: Witness::default(),
+            });
+        }
+
+        for psbtout in self.inner.outputs.iter() {
+            tx.output.push(TxOut {
+                value: psbtout.amount.unwrap(),
+                script_pubkey: psbtout.script.as_ref().unwrap().clone(),
+            });
+        }
+
+        Ok(tx)
+    }
+
+    /// Extracts the [`Transaction`] from a PSBT by filling in the available signature information.
+    pub fn extract_tx(self) -> Result<Transaction, Error> {
+        let mut tx = {
+            if self.inner.version >= Version::PsbtV0 {
+                return self.construct_unsigned_tx();
+            }
+            Ok(self.inner.unsigned_tx.unwrap()) as Result<Transaction, Error>
+        }?;
+
+        for (vin, psbtin) in tx.input.iter_mut().zip(self.inner.inputs.into_iter()) {
+            vin.script_sig = psbtin.final_script_sig.unwrap_or_default();
+            vin.witness = psbtin.final_script_witness.unwrap_or_default();
+        }
+
+        Ok(tx)
     }
 
     /// Combines this [`Psbt`] with `other` PSBT as described by BIP 174.
     ///
     /// In accordance with BIP 174 this function is commutative i.e., `A.combine(B) == B.combine(A)`
     pub fn combine(&mut self, other: Self) -> Result<(), Error> {
-        let self_inner = &mut self.inner;
-        let other_inner = other.inner;
-        match (self_inner.version, other_inner.version) {
+        match (self.inner.version, other.inner.version) {
             (Version::PsbtV0, Version::PsbtV0) => {
-                let other_unsigned_tx = other_inner.unsigned_tx.unwrap();
-                let self_unsigned_tx = self_inner.unsigned_tx.as_ref().unwrap();
+                let other_unsigned_tx = other.inner.unsigned_tx.unwrap();
+                let self_unsigned_tx = self.inner.unsigned_tx.as_ref().unwrap();
                 if self_unsigned_tx != &other_unsigned_tx {
                     return Err(Error::UnexpectedUnsignedTx {
                         expected: Box::new(self_unsigned_tx.clone()),
                         actual: Box::new(other_unsigned_tx),
                     });
                 }
+            }
+            (Version::PsbtV2, Version::PsbtV2) => {
+                // Construct the unsigned transactions
+                let mut self_unsigned_tx = self.construct_unsigned_tx()?;
+                for txin in self_unsigned_tx.input.iter_mut() {
+                    txin.sequence = Sequence::ZERO;
+                }
 
-                // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
-                //          the specification. It can pick arbitrarily when conflicts occur.
+                let mut other_unsigned_tx = other.construct_unsigned_tx()?;
+                for txin in other_unsigned_tx.input.iter_mut() {
+                    txin.sequence = Sequence::ZERO;
+                }
 
-                // Merging xpubs
-                for (xpub, (fingerprint1, derivation1)) in other_inner.xpub {
-                    match self_inner.xpub.entry(xpub) {
-                        btree_map::Entry::Vacant(entry) => {
-                            entry.insert((fingerprint1, derivation1));
+                if self_unsigned_tx != other_unsigned_tx {
+                    return Err(Error::UnexpectedUnsignedTx {
+                        expected: Box::new(self_unsigned_tx),
+                        actual: Box::new(other_unsigned_tx)
+                    });
+                }
+
+                if self.inner.fallback_locktime.is_none()
+                    && other.inner.fallback_locktime.is_some() {
+                    self.inner.fallback_locktime = other.inner.fallback_locktime;
+                }
+
+                if other.inner.tx_modifiable.is_some() {
+                    match self.inner.tx_modifiable.as_mut() {
+                        Some(tx_modifiable) => {
+                            tx_modifiable.combine(other.inner.tx_modifiable.as_ref().unwrap())?;
                         }
-                        btree_map::Entry::Occupied(mut entry) => {
-                            // Here in case of the conflict we select the version with algorithm:
-                            // 1) if everything is equal we do nothing
-                            // 2) report an error if
-                            //    - derivation paths are equal and fingerprints are not
-                            //    - derivation paths are of the same length, but not equal
-                            //    - derivation paths has different length, but the shorter one
-                            //      is not the strict suffix of the longer one
-                            // 3) choose longest derivation otherwise
-
-                            let (fingerprint2, derivation2) = entry.get().clone();
-
-                            if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
-                                || (derivation1.len() < derivation2.len()
-                                    && derivation1[..]
-                                        == derivation2[derivation2.len() - derivation1.len()..])
-                            {
-                                continue;
-                            } else if derivation2[..]
-                                == derivation1[derivation1.len() - derivation2.len()..]
-                            {
-                                entry.insert((fingerprint1, derivation1));
-                                continue;
-                            }
-                            return Err(Error::CombineInconsistentKeySources(Box::new(xpub)));
+                        None => {
+                            self.inner.tx_modifiable = other.inner.tx_modifiable;
                         }
                     }
                 }
-
-                self_inner.proprietary.extend(other_inner.proprietary);
-                self_inner.unknown.extend(other_inner.unknown);
-
-                for (self_input, other_input) in
-                    self_inner.inputs.iter_mut().zip(other_inner.inputs.into_iter())
-                {
-                    self_input.combine(other_input);
-                }
-
-                for (self_output, other_output) in
-                    self_inner.outputs.iter_mut().zip(other_inner.outputs.into_iter())
-                {
-                    self_output.combine(other_output);
-                }
-
-                Ok(())
-            }
-            (Version::PsbtV2, Version::PsbtV2) => {
-                // TODO
-                Ok(())
             }
             (Version::PsbtV0, Version::PsbtV2) => {
-                // TODO
-                Ok(())
+                let mut other_unsigned_tx = other.construct_unsigned_tx()?;
+                for txin in other_unsigned_tx.input.iter_mut() {
+                    txin.sequence = Sequence::ZERO;
+                }
+
+                let self_unsigned_tx = self.inner.unsigned_tx.as_ref().unwrap();
+                if self_unsigned_tx != &other_unsigned_tx {
+                    return Err(Error::UnexpectedUnsignedTx {
+                        expected: Box::new(self_unsigned_tx.clone()),
+                        actual: Box::new(other_unsigned_tx)
+                    });
+                }
+
+                // Convert it into a PsbtV2
+                self.inner.version = Version::PsbtV2;
+                self.inner.tx_version = other.inner.tx_version;
+                self.inner.fallback_locktime = other.inner.fallback_locktime;
+                self.inner.tx_modifiable = other.inner.tx_modifiable;
+                self.inner.unsigned_tx = None;
             }
             (Version::PsbtV2, Version::PsbtV0) => {
-                // TODO
-                Ok(())
+                let mut self_unsigned_tx = self.construct_unsigned_tx()?;
+                for txin in self_unsigned_tx.input.iter_mut() {
+                    txin.sequence = Sequence::ZERO;
+                }
+                let other_unsigned_tx = other.inner.unsigned_tx.unwrap();
+                if self_unsigned_tx != other_unsigned_tx {
+                    return Err(Error::UnexpectedUnsignedTx {
+                        expected: Box::new(self_unsigned_tx),
+                        actual: Box::new(other_unsigned_tx)
+                    });
+                }
             }
         }
+
+        // BIP 174: The Combiner must remove any duplicate key-value pairs, in accordance with
+        //          the specification. It can pick arbitrarily when conflicts occur.
+
+        // Merging xpubs
+        for (xpub, (fingerprint1, derivation1)) in other.inner.xpub {
+            match self.inner.xpub.entry(xpub) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert((fingerprint1, derivation1));
+                }
+                btree_map::Entry::Occupied(mut entry) => {
+                    // Here in case of the conflict we select the version with algorithm:
+                    // 1) if everything is equal we do nothing
+                    // 2) report an error if
+                    //    - derivation paths are equal and fingerprints are not
+                    //    - derivation paths are of the same length, but not equal
+                    //    - derivation paths has different length, but the shorter one
+                    //      is not the strict suffix of the longer one
+                    // 3) choose longest derivation otherwise
+
+                    let (fingerprint2, derivation2) = entry.get().clone();
+
+                    if (derivation1 == derivation2 && fingerprint1 == fingerprint2)
+                        || (derivation1.len() < derivation2.len()
+                            && derivation1[..]
+                                == derivation2[derivation2.len() - derivation1.len()..])
+                    {
+                        continue;
+                    } else if derivation2[..]
+                        == derivation1[derivation1.len() - derivation2.len()..]
+                    {
+                        entry.insert((fingerprint1, derivation1));
+                        continue;
+                    }
+                    return Err(Error::CombineInconsistentKeySources(Box::new(xpub)));
+                }
+            }
+        }
+
+        self.inner.proprietary.extend(other.inner.proprietary);
+        self.inner.unknown.extend(other.inner.unknown);
+
+        for (self_input, other_input) in
+            self.inner.inputs.iter_mut().zip(other.inner.inputs.into_iter())
+        {
+            self_input.combine(other_input);
+        }
+
+        for (self_output, other_output) in
+            self.inner.outputs.iter_mut().zip(other.inner.outputs.into_iter())
+        {
+            self_output.combine(other_output);
+        }
+
+        self.inner.validate_inner()
     }
 
     /// Attempts to create _all_ the required signatures for this PSBT using `k`.
