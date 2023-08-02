@@ -10,7 +10,7 @@ use bitcoin::blockdata::opcodes::OP_0;
 use bitcoin::blockdata::script;
 use bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bitcoin::hex::FromHex;
-use bitcoin::psbt::{Psbt, PsbtSighashType};
+use bitcoin::psbt::{Psbt, PsbtInner, PsbtSighashType};
 use bitcoin::script::PushBytes;
 use bitcoin::secp256k1::{self, Secp256k1};
 use bitcoin::{
@@ -208,14 +208,15 @@ fn create_psbt(tx: Transaction) -> Psbt {
     let expected_psbt_hex = include_str!("data/create_psbt_hex");
     let expected_psbt = hex_psbt!(expected_psbt_hex).unwrap();
 
-    let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    let inner = PsbtInner::from_unsigned_tx(tx).unwrap();
+    let psbt = Psbt::from_inner(inner).unwrap();
 
     assert_eq!(psbt, expected_psbt);
     psbt
 }
 
 /// Updates `psbt` according to the BIP, returns the newly updated PSBT. Verifies against BIP 174 test vector.
-fn update_psbt(mut psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
+fn update_psbt(psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
     // Strings from BIP 174 test vector.
     let previous_tx_0 = include_str!("data/previous_tx_0_hex");
     let previous_tx_1 = include_str!("data/previous_tx_1_hex");
@@ -237,8 +238,9 @@ fn update_psbt(mut psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
 
     let expected_psbt_hex = include_str!("data/update_1_psbt_hex");
     let expected_psbt = hex_psbt!(expected_psbt_hex).unwrap();
+    let expected_psbt_inner = expected_psbt.inner_ref();
 
-    let mut input_0 = psbt.inputs[0].clone();
+    let mut input_0 = expected_psbt_inner.inputs[0].clone();
 
     let v = Vec::from_hex(previous_tx_1).unwrap();
     let tx: Transaction = deserialize(&v).unwrap();
@@ -246,7 +248,7 @@ fn update_psbt(mut psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
     input_0.redeem_script = Some(hex_script!(redeem_script_0));
     input_0.bip32_derivation = bip32_derivation(fingerprint, &pk_path, vec![0, 1]);
 
-    let mut input_1 = psbt.inputs[1].clone();
+    let mut input_1 = expected_psbt_inner.inputs[1].clone();
 
     let v = Vec::from_hex(previous_tx_0).unwrap();
     let tx: Transaction = deserialize(&v).unwrap();
@@ -256,15 +258,17 @@ fn update_psbt(mut psbt: Psbt, fingerprint: Fingerprint) -> Psbt {
     input_1.witness_script = Some(hex_script!(witness_script));
     input_1.bip32_derivation = bip32_derivation(fingerprint, &pk_path, vec![2, 3]);
 
-    psbt.inputs = vec![input_0, input_1];
+    let mut psbt_inner = psbt.into_inner();
+    psbt_inner.inputs = vec![input_0, input_1];
 
-    let mut output_0 = psbt.outputs[0].clone();
+    let mut output_0 = expected_psbt_inner.outputs[0].clone();
     output_0.bip32_derivation = bip32_derivation(fingerprint, &pk_path, vec![4]);
 
-    let mut output_1 = psbt.outputs[1].clone();
+    let mut output_1 = expected_psbt_inner.outputs[1].clone();
     output_1.bip32_derivation = bip32_derivation(fingerprint, &pk_path, vec![5]);
 
-    psbt.outputs = vec![output_0, output_1];
+    psbt_inner.outputs = vec![output_0, output_1];
+    let psbt = Psbt::from_inner(psbt_inner).unwrap();
 
     assert_eq!(psbt, expected_psbt);
     psbt
@@ -291,18 +295,20 @@ fn bip32_derivation(
 }
 
 /// Does the second update according to the BIP, returns the newly updated PSBT. Verifies against BIP 174 test vector.
-fn update_psbt_with_sighash_all(mut psbt: Psbt) -> Psbt {
+fn update_psbt_with_sighash_all(psbt: Psbt) -> Psbt {
     let expected_psbt_hex = include_str!("data/update_2_psbt_hex");
     let expected_psbt = hex_psbt!(expected_psbt_hex).unwrap();
+    let mut psbt_inner = psbt.into_inner();
 
     let ty = PsbtSighashType::from_str("SIGHASH_ALL").unwrap();
 
-    let mut input_0 = psbt.inputs[0].clone();
+    let mut input_0 = psbt_inner.inputs[0].clone();
     input_0.sighash_type = Some(ty);
-    let mut input_1 = psbt.inputs[1].clone();
+    let mut input_1 = psbt_inner.inputs[1].clone();
     input_1.sighash_type = Some(ty);
 
-    psbt.inputs = vec![input_0, input_1];
+    psbt_inner.inputs = vec![input_0, input_1];
+    let psbt = Psbt::from_inner(psbt_inner).unwrap();
 
     assert_eq!(psbt, expected_psbt);
     psbt
@@ -380,7 +386,7 @@ fn finalize(psbt: Psbt) -> Psbt {
 fn extract_transaction(psbt: Psbt) -> Transaction {
     let expected_tx_hex = include_str!("data/extract_tx_hex");
 
-    let tx = psbt.extract_tx();
+    let tx = psbt.extract_tx().unwrap();
 
     let got = serialize_hex(&tx);
     assert_eq!(got, expected_tx_hex);
@@ -416,56 +422,57 @@ fn sign(mut psbt: Psbt, keys: BTreeMap<bitcoin::PublicKey, PrivateKey>) -> Psbt 
 
 /// Finalizes a PSBT accord to the Input Finalizer role described in BIP 174.
 /// This is just a test. For a production-ready PSBT Finalizer, use [rust-miniscript](https://docs.rs/miniscript/latest/miniscript/psbt/trait.PsbtExt.html#tymethod.finalize)
-fn finalize_psbt(mut psbt: Psbt) -> Psbt {
+fn finalize_psbt(psbt: Psbt) -> Psbt {
+    let mut psbt_inner = psbt.into_inner();
     // Input 0: legacy UTXO
 
-    let sigs: Vec<_> = psbt.inputs[0].partial_sigs.values().collect();
+    let sigs: Vec<_> = psbt_inner.inputs[0].partial_sigs.values().collect();
     let script_sig = script::Builder::new()
         .push_opcode(OP_0) // OP_CHECKMULTISIG bug pops +1 value when evaluating so push OP_0.
         .push_slice(sigs[0].serialize())
         .push_slice(sigs[1].serialize())
         .push_slice(
-            <&PushBytes>::try_from(psbt.inputs[0].redeem_script.as_ref().unwrap().as_bytes())
+            <&PushBytes>::try_from(psbt_inner.inputs[0].redeem_script.as_ref().unwrap().as_bytes())
                 .unwrap(),
         )
         .into_script();
 
-    psbt.inputs[0].final_script_sig = Some(script_sig);
+    psbt_inner.inputs[0].final_script_sig = Some(script_sig);
 
-    psbt.inputs[0].partial_sigs = BTreeMap::new();
-    psbt.inputs[0].sighash_type = None;
-    psbt.inputs[0].redeem_script = None;
-    psbt.inputs[0].bip32_derivation = BTreeMap::new();
+    psbt_inner.inputs[0].partial_sigs = BTreeMap::new();
+    psbt_inner.inputs[0].sighash_type = None;
+    psbt_inner.inputs[0].redeem_script = None;
+    psbt_inner.inputs[0].bip32_derivation = BTreeMap::new();
 
     // Input 1: SegWit UTXO
 
     let script_sig = script::Builder::new()
         .push_slice(
-            <&PushBytes>::try_from(psbt.inputs[1].redeem_script.as_ref().unwrap().as_bytes())
+            <&PushBytes>::try_from(psbt_inner.inputs[1].redeem_script.as_ref().unwrap().as_bytes())
                 .unwrap(),
         )
         .into_script();
 
-    psbt.inputs[1].final_script_sig = Some(script_sig);
+    psbt_inner.inputs[1].final_script_sig = Some(script_sig);
 
     let script_witness = {
-        let sigs: Vec<_> = psbt.inputs[1].partial_sigs.values().collect();
+        let sigs: Vec<_> = psbt_inner.inputs[1].partial_sigs.values().collect();
         let mut script_witness = Witness::new();
         script_witness.push([]); // Push 0x00 to the stack.
         script_witness.push(&sigs[1].to_vec());
         script_witness.push(&sigs[0].to_vec());
-        script_witness.push(psbt.inputs[1].witness_script.clone().unwrap().as_bytes());
+        script_witness.push(psbt_inner.inputs[1].witness_script.clone().unwrap().as_bytes());
 
         script_witness
     };
 
-    psbt.inputs[1].final_script_witness = Some(script_witness);
+    psbt_inner.inputs[1].final_script_witness = Some(script_witness);
 
-    psbt.inputs[1].partial_sigs = BTreeMap::new();
-    psbt.inputs[1].sighash_type = None;
-    psbt.inputs[1].redeem_script = None;
-    psbt.inputs[1].witness_script = None;
-    psbt.inputs[1].bip32_derivation = BTreeMap::new();
+    psbt_inner.inputs[1].partial_sigs = BTreeMap::new();
+    psbt_inner.inputs[1].sighash_type = None;
+    psbt_inner.inputs[1].redeem_script = None;
+    psbt_inner.inputs[1].witness_script = None;
+    psbt_inner.inputs[1].bip32_derivation = BTreeMap::new();
 
-    psbt
+    Psbt::from_inner(psbt_inner).unwrap()
 }

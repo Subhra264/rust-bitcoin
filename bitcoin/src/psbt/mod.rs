@@ -295,8 +295,13 @@ impl Psbt {
     /// Returns the underlying [PsbtInner]
     ///
     /// Since the ownership is lost, another [Psbt] needs to be created using `Psbt::from_inner`.
-    pub fn to_inner(self) -> PsbtInner {
+    pub fn into_inner(self) -> PsbtInner {
         self.inner
+    }
+
+    /// Returns an immutable reference to the underlying [`PsbtInner`]
+    pub fn inner_ref(&self) -> &PsbtInner {
+        &self.inner
     }
 
     /// Returns an iterator for the funding UTXOs of the psbt
@@ -541,9 +546,10 @@ impl Psbt {
     pub fn extract_tx(self) -> Result<Transaction, Error> {
         let mut tx = {
             if self.inner.version >= Version::PsbtV0 {
-                return self.construct_unsigned_tx();
+                self.construct_unsigned_tx()
+            } else {
+                Ok(self.inner.unsigned_tx.unwrap())
             }
-            Ok(self.inner.unsigned_tx.unwrap()) as Result<Transaction, Error>
         }?;
 
         for (vin, psbtin) in tx.input.iter_mut().zip(self.inner.inputs.into_iter()) {

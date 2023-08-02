@@ -82,7 +82,7 @@ use bitcoin::bip32::{ChildNumber, DerivationPath, ExtendedPrivKey, ExtendedPubKe
 use bitcoin::consensus::encode;
 use bitcoin::key::{TapTweak, XOnlyPublicKey};
 use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_DROP};
-use bitcoin::psbt::{self, Input, Output, Psbt, PsbtSighashType};
+use bitcoin::psbt::{self, Input, Output, Psbt, PsbtSighashType, PsbtInner};
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::sighash::{self, SighashCache, TapSighash, TapSighashType};
 use bitcoin::taproot::{self, LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo};
@@ -240,7 +240,7 @@ fn generate_bip86_key_spend_tx(
         }],
         output: outputs,
     };
-    let mut psbt = Psbt::from_unsigned_tx(tx1)?;
+    let mut psbt_inner = PsbtInner::from_unsigned_tx(tx1)?;
 
     let mut origins = BTreeMap::new();
     origins.insert(
@@ -266,11 +266,11 @@ fn generate_bip86_key_spend_tx(
     let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
     input.sighash_type = Some(ty);
     input.tap_internal_key = Some(input_pubkey);
-    psbt.inputs = vec![input];
+    psbt_inner.inputs = vec![input];
 
     // SIGNER
-    let unsigned_tx = psbt.unsigned_tx.clone();
-    psbt.inputs.iter_mut().enumerate().try_for_each::<_, Result<(), Box<dyn std::error::Error>>>(
+    let unsigned_tx = psbt_inner.unsigned_tx.as_ref().unwrap().clone();
+    psbt_inner.inputs.iter_mut().enumerate().try_for_each::<_, Result<(), Box<dyn std::error::Error>>>(
         |(vout, input)| {
             let hash_ty = input
                 .sighash_type
@@ -306,7 +306,7 @@ fn generate_bip86_key_spend_tx(
     )?;
 
     // FINALIZER
-    psbt.inputs.iter_mut().for_each(|input| {
+    psbt_inner.inputs.iter_mut().for_each(|input| {
         let mut script_witness: Witness = Witness::new();
         script_witness.push(input.tap_key_sig.unwrap().to_vec());
         input.final_script_witness = Some(script_witness);
@@ -320,7 +320,8 @@ fn generate_bip86_key_spend_tx(
     });
 
     // EXTRACTOR
-    let tx = psbt.extract_tx();
+    let psbt = Psbt::from_inner(psbt_inner)?;
+    let tx = psbt.extract_tx()?;
     tx.verify(|_| {
         Some(TxOut {
             value: from_amount,
@@ -425,7 +426,7 @@ impl BenefactorWallet {
             }],
             output: vec![],
         };
-        let mut next_psbt = Psbt::from_unsigned_tx(next_tx)?;
+        let mut next_psbt_inner = PsbtInner::from_unsigned_tx(next_tx)?;
         let mut origins = BTreeMap::new();
         origins.insert(
             beneficiary_key,
@@ -455,7 +456,8 @@ impl BenefactorWallet {
             ..Default::default()
         };
 
-        next_psbt.inputs = vec![input];
+        next_psbt_inner.inputs = vec![input];
+        let next_psbt = Psbt::from_inner(next_psbt_inner)?;
         self.next_psbt = Some(next_psbt.clone());
 
         self.next.increment()?;
@@ -467,8 +469,9 @@ impl BenefactorWallet {
         lock_time_delta: u32,
     ) -> Result<(Transaction, Psbt), Box<dyn std::error::Error>> {
         if let Some(ref spend_info) = self.current_spend_info.clone() {
-            let mut psbt = self.next_psbt.clone().expect("Should have next_psbt");
-            let input = &mut psbt.inputs[0];
+            let psbt = self.next_psbt.clone().expect("Should have next_psbt");
+            let mut psbt_inner = psbt.into_inner();
+            let input = &mut psbt_inner.inputs[0];
             let input_value = input.witness_utxo.as_ref().unwrap().value;
             let output_value = input_value - ABSOLUTE_FEES_IN_SATS;
 
@@ -485,7 +488,7 @@ impl BenefactorWallet {
 
             // Build up the leaf script and combine with internal key into a taproot commitment
             let lock_time = absolute::LockTime::from_height(
-                psbt.unsigned_tx.lock_time.to_consensus_u32() + lock_time_delta,
+                psbt_inner.unsigned_tx.as_ref().unwrap().lock_time.to_consensus_u32() + lock_time_delta,
             )
             .unwrap();
             let script = Self::time_lock_script(lock_time, beneficiary_key);
@@ -503,16 +506,16 @@ impl BenefactorWallet {
                 taproot_spend_info.merkle_root(),
             );
 
-            psbt.unsigned_tx.output =
+            psbt_inner.unsigned_tx.as_mut().unwrap().output =
                 vec![TxOut { script_pubkey: output_script_pubkey.clone(), value: output_value }];
-            psbt.outputs = vec![Output::default()];
-            psbt.unsigned_tx.lock_time = absolute::LockTime::ZERO;
+            psbt_inner.outputs = vec![Output::default()];
+            psbt_inner.unsigned_tx.as_mut().unwrap().lock_time = absolute::LockTime::ZERO;
 
             let hash_ty = input
                 .sighash_type
                 .and_then(|psbt_sighash_type| psbt_sighash_type.taproot_hash_ty().ok())
                 .unwrap_or(TapSighashType::All);
-            let hash = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
+            let hash = SighashCache::new(psbt_inner.unsigned_tx.as_ref().unwrap()).taproot_key_spend_signature_hash(
                 0,
                 &sighash::Prevouts::All(&[TxOut {
                     value: input_value,
@@ -540,7 +543,7 @@ impl BenefactorWallet {
             }
 
             // FINALIZER
-            psbt.inputs.iter_mut().for_each(|input| {
+            psbt_inner.inputs.iter_mut().for_each(|input| {
                 let mut script_witness: Witness = Witness::new();
                 script_witness.push(input.tap_key_sig.unwrap().to_vec());
                 input.final_script_witness = Some(script_witness);
@@ -554,7 +557,8 @@ impl BenefactorWallet {
             });
 
             // EXTRACTOR
-            let tx = psbt.extract_tx();
+            let psbt = Psbt::from_inner(psbt_inner)?;
+            let tx = psbt.extract_tx()?;
             tx.verify(|_| {
                 Some(TxOut { value: input_value, script_pubkey: output_script_pubkey.clone() })
             })
@@ -571,7 +575,7 @@ impl BenefactorWallet {
                 }],
                 output: vec![],
             };
-            let mut next_psbt = Psbt::from_unsigned_tx(next_tx)?;
+            let mut next_psbt_inner = PsbtInner::from_unsigned_tx(next_tx)?;
             let mut origins = BTreeMap::new();
             origins.insert(
                 beneficiary_key,
@@ -601,7 +605,8 @@ impl BenefactorWallet {
                 ..Default::default()
             };
 
-            next_psbt.inputs = vec![input];
+            next_psbt_inner.inputs = vec![input];
+            let next_psbt = Psbt::from_inner(next_psbt_inner)?;
             self.next_psbt = Some(next_psbt.clone());
 
             self.next.increment()?;
@@ -630,24 +635,25 @@ impl BeneficiaryWallet {
 
     fn spend_inheritance(
         &self,
-        mut psbt: Psbt,
+        psbt: Psbt,
         lock_time: absolute::LockTime,
         to_address: Address,
     ) -> Result<Transaction, Box<dyn std::error::Error>> {
-        let input_value = psbt.inputs[0].witness_utxo.as_ref().unwrap().value;
+        let mut psbt_inner = psbt.into_inner();
+        let input_value = psbt_inner.inputs[0].witness_utxo.as_ref().unwrap().value;
         let input_script_pubkey =
-            psbt.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey.clone();
-        psbt.unsigned_tx.lock_time = lock_time;
-        psbt.unsigned_tx.output = vec![TxOut {
+            psbt_inner.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey.clone();
+        psbt_inner.unsigned_tx.as_mut().unwrap().lock_time = lock_time;
+        psbt_inner.unsigned_tx.as_mut().unwrap().output = vec![TxOut {
             script_pubkey: to_address.script_pubkey(),
             value: input_value - ABSOLUTE_FEES_IN_SATS,
         }];
-        psbt.outputs = vec![Output::default()];
-        let unsigned_tx = psbt.unsigned_tx.clone();
+        psbt_inner.outputs = vec![Output::default()];
+        let unsigned_tx = psbt_inner.unsigned_tx.as_ref().unwrap().clone();
 
         // SIGNER
         for (x_only_pubkey, (leaf_hashes, (_, derivation_path))) in
-            &psbt.inputs[0].tap_key_origins.clone()
+            &psbt_inner.inputs[0].tap_key_origins.clone()
         {
             let secret_key =
                 self.master_xpriv.derive_priv(&self.secp, &derivation_path)?.to_priv().inner;
@@ -666,7 +672,7 @@ impl BeneficiaryWallet {
                     &secret_key,
                     *x_only_pubkey,
                     Some(*lh),
-                    &mut psbt.inputs[0],
+                    &mut psbt_inner.inputs[0],
                     hash,
                     hash_ty,
                     &self.secp,
@@ -675,7 +681,7 @@ impl BeneficiaryWallet {
         }
 
         // FINALIZER
-        psbt.inputs.iter_mut().for_each(|input| {
+        psbt_inner.inputs.iter_mut().for_each(|input| {
             let mut script_witness: Witness = Witness::new();
             for (_, signature) in input.tap_script_sigs.iter() {
                 script_witness.push(signature.to_vec());
@@ -698,7 +704,8 @@ impl BeneficiaryWallet {
         });
 
         // EXTRACTOR
-        let tx = psbt.extract_tx();
+        let psbt = Psbt::from_inner(psbt_inner)?;
+        let tx = psbt.extract_tx()?;
         tx.verify(|_| {
             Some(TxOut { value: input_value, script_pubkey: input_script_pubkey.clone() })
         })

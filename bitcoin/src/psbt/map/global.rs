@@ -84,12 +84,12 @@ impl Map for Psbt {
 
             rv.push(raw::Pair {
                 key: raw::Key { type_value: PSBT_GLOBAL_INPUT_COUNT, key: vec![] },
-                value: inner.inputs.len().to_be_bytes().to_vec(),
+                value: encode::serialize(&VarInt(inner.inputs.len() as u64)),
             });
 
             rv.push(raw::Pair {
                 key: raw::Key { type_value: PSBT_GLOBAL_OUTPUT_COUNT, key: vec![] },
-                value: inner.outputs.len().to_be_bytes().to_vec(),
+                value: encode::serialize(&VarInt(inner.outputs.len() as u64)),
             });
 
             // Optional in PsbtV2

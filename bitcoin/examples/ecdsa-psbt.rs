@@ -38,7 +38,7 @@ use bitcoin::bip32::{
 };
 use bitcoin::consensus::encode;
 use bitcoin::locktime::absolute;
-use bitcoin::psbt::{self, Input, Psbt, PsbtSighashType};
+use bitcoin::psbt::{self, Input, Psbt, PsbtInner, PsbtSighashType};
 use bitcoin::secp256k1::{Secp256k1, Signing, Verification};
 use bitcoin::{
     Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     let finalized = online.finalize_psbt(signed)?;
 
     // You can use `bt sendrawtransaction` to broadcast the extracted transaction.
-    let tx = finalized.extract_tx();
+    let tx = finalized.extract_tx()?;
     tx.verify(|_| Some(previous_output())).expect("failed to verify transaction");
 
     let hex = encode::serialize_hex(&tx);
@@ -197,13 +197,12 @@ impl WatchOnly {
             ],
         };
 
-        let psbt = Psbt::from_unsigned_tx(tx)?;
-
-        Ok(psbt)
+        let psbt_inner = PsbtInner::from_unsigned_tx(tx)?;
+        Ok(Psbt::from_inner(psbt_inner)?)
     }
 
     /// Updates the PSBT, in BIP174 parlance this is the 'Updater'.
-    fn update_psbt(&self, mut psbt: Psbt) -> Result<Psbt> {
+    fn update_psbt(&self, psbt: Psbt) -> Result<Psbt> {
         let mut input = Input { witness_utxo: Some(previous_output()), ..Default::default() };
 
         let pk = self.input_xpub.to_pub();
@@ -221,33 +220,35 @@ impl WatchOnly {
         let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
         input.sighash_type = Some(ty);
 
-        psbt.inputs = vec![input];
+        let mut psbt_inner = psbt.into_inner();
+        psbt_inner.inputs = vec![input];
 
-        Ok(psbt)
+        Ok(Psbt::from_inner(psbt_inner)?)
     }
 
     /// Finalizes the PSBT, in BIP174 parlance this is the 'Finalizer'.
     /// This is just an example. For a production-ready PSBT Finalizer, use [rust-miniscript](https://docs.rs/miniscript/latest/miniscript/psbt/trait.PsbtExt.html#tymethod.finalize)
-    fn finalize_psbt(&self, mut psbt: Psbt) -> Result<Psbt> {
-        if psbt.inputs.is_empty() {
+    fn finalize_psbt(&self, psbt: Psbt) -> Result<Psbt> {
+        let mut psbt_inner = psbt.into_inner();
+        if psbt_inner.inputs.is_empty() {
             return Err(psbt::SignError::MissingInputUtxo.into());
         }
 
-        let sigs: Vec<_> = psbt.inputs[0].partial_sigs.values().collect();
+        let sigs: Vec<_> = psbt_inner.inputs[0].partial_sigs.values().collect();
         let mut script_witness: Witness = Witness::new();
         script_witness.push(&sigs[0].to_vec());
         script_witness.push(self.input_xpub.to_pub().to_bytes());
 
-        psbt.inputs[0].final_script_witness = Some(script_witness);
+        psbt_inner.inputs[0].final_script_witness = Some(script_witness);
 
         // Clear all the data fields as per the spec.
-        psbt.inputs[0].partial_sigs = BTreeMap::new();
-        psbt.inputs[0].sighash_type = None;
-        psbt.inputs[0].redeem_script = None;
-        psbt.inputs[0].witness_script = None;
-        psbt.inputs[0].bip32_derivation = BTreeMap::new();
+        psbt_inner.inputs[0].partial_sigs = BTreeMap::new();
+        psbt_inner.inputs[0].sighash_type = None;
+        psbt_inner.inputs[0].redeem_script = None;
+        psbt_inner.inputs[0].witness_script = None;
+        psbt_inner.inputs[0].bip32_derivation = BTreeMap::new();
 
-        Ok(psbt)
+        Ok(Psbt::from_inner(psbt_inner)?)
     }
 
     /// Returns data for the first change address (standard BIP84 derivation path
