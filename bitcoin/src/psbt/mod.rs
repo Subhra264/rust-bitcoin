@@ -355,6 +355,23 @@ impl Psbt {
         }
     }
 
+    /// Adds a new [`Output`] to this PsbtV2.
+    /// 
+    /// Only to be used for PsbtV2. Returns [`Error`] otherwise.
+    pub fn add_output(&mut self, output: Output) -> Result<(), Error> {
+        if self.inner.version == Version::PsbtV0 {
+            return Err(Error::Version("New outputs can not be added to PsbtV0"));
+        }
+        if self.inner.tx_modifiable.is_none()
+            || !self.inner.tx_modifiable.as_ref().unwrap().output_modifiable
+        {
+            return Err(Error::OutputNotAddable);
+        }
+        output.validate_version(self.inner.version)?;
+        self.inner.outputs.push(output);
+        Ok(())
+    }
+
     /// Computes the locktime for a Non-PsbtV0
     fn compute_locktime(&self) -> Result<absolute::LockTime, Error> {
         let inner = &self.inner;

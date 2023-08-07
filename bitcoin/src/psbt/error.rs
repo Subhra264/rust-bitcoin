@@ -129,6 +129,8 @@ pub enum Error {
     /// Computing Locktime error for Non-PsbtV0 indicating the
     /// required Locktime not present in the input. 
     RequiredLocktimeNotPresent,
+    /// Outputs can not be modified as `output_modifiable` flag is `false` in PsbtV2.
+    OutputNotAddable,
 }
 
 impl fmt::Display for Error {
@@ -196,6 +198,8 @@ impl fmt::Display for Error {
             Error::InvalidInput => f.write_str("input not valid"),
             Error::InvalidOutput => f.write_str("output not valid"),
             Error::RequiredLocktimeNotPresent => f.write_str("required locktime not present in this Psbt input"),
+            Error::OutputNotAddable =>
+                f.write_str("output can not be added as output_modifiable flag is false"),
         }
     }
 }
@@ -247,7 +251,8 @@ impl std::error::Error for Error {
             | InvalidInputOutputCounts
             | InvalidInput
             | InvalidOutput
-            | RequiredLocktimeNotPresent => None,
+            | RequiredLocktimeNotPresent
+            | OutputNotAddable => None,
         }
     }
 }
